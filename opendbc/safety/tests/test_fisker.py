@@ -434,13 +434,75 @@ class TestFiskerHooks(unittest.TestCase):
           blocked = addr in (0x1D0, 0x1C0) or bool(long)
           self.assertEqual(self.safety.safety_fwd_hook(0, addr), -1 if blocked else 2)
 
-  def test_oem_accel_blocked_only_when_long_engaged(self):
+  LONG_RELAY_TIMEOUT_US = 60_000
+
+  def test_oem_long_frames_flow_until_we_send_our_own(self):
     for long in (0, 1):
       for allowed in (False, True):
         with self.subTest(long=long, allowed=allowed):
           self._init(long)
           self.safety.set_controls_allowed(allowed)
-          self.assertEqual(self.safety.safety_fwd_hook(2, 0x121), -1 if (long and allowed) else 0)
+          for addr in (0x121, 0x117, 0x118):
+            self.assertEqual(self.safety.safety_fwd_hook(2, addr), 0)
+
+  def test_oem_long_frame_blocked_while_ours_is_sent(self):
+    # One sender per message: ours while we send it, the OEM's otherwise, whatever controls_allowed says (with the
+    # old controls_allowed rule both 0x121 streams reached the VCU whenever we sent with controls not allowed).
+    for allowed in (False, True):
+      for addr in (0x121, 0x117, 0x118):
+        with self.subTest(allowed=allowed, addr=hex(addr)):
+          self._init(1)
+          self.safety.set_controls_allowed(allowed)
+          t = 1_000_000
+          self.safety.set_timer(t)
+          dat = self._u16_msg(self.ACCEL_INACTIVE) if addr == 0x121 else bytearray(8)
+          self.assertTrue(self._tx(addr, dat))
+          self.assertEqual(self.safety.safety_fwd_hook(2, addr), -1)
+          for other in {0x121, 0x117, 0x118} - {addr}:           # per message: the others still flow
+            self.assertEqual(self.safety.safety_fwd_hook(2, other), 0)
+          self.safety.set_timer(t + self.LONG_RELAY_TIMEOUT_US - 1)
+          self.assertEqual(self.safety.safety_fwd_hook(2, addr), -1)
+          self.safety.set_timer(t + self.LONG_RELAY_TIMEOUT_US)   # we stopped: the OEM's resumes
+          self.assertEqual(self.safety.safety_fwd_hook(2, addr), 0)
+
+  def test_rejected_accel_does_not_block_oem_accel(self):
+    self._init(1)
+    self.safety.set_controls_allowed(True)
+    self.safety.set_timer(1_000_000)
+    self.assertFalse(self._tx(0x121, self._u16_msg(self.ACCEL_MAX + 1)))
+    self.assertEqual(self.safety.safety_fwd_hook(2, 0x121), 0)
+
+  def test_long_status_frames_cannot_request_gear_epb_or_braking(self):
+    from opendbc.can import CANPacker
+    from opendbc.car import Bus
+    from opendbc.car.fisker.fiskercan import FiskerCAN
+    from opendbc.car.fisker.values import CAR, DBC
+    fc = FiskerCAN(None, CANPacker(DBC[CAR.FISKER_OCEAN][Bus.pt]))
+    # (byte, mask) of each request that must stay 0: 0x117 park gear, emergency EPB, emergency/park standstill;
+    # 0x118 HBA, ESP standstill, brake prefill, AEB activation
+    forbidden = {0x117: ((4, 0x01), (4, 0x08), (5, 0x10), (3, 0x10), (3, 0x20)),
+                 0x118: ((3, 0x01), (3, 0x04), (3, 0x20), (4, 0x10), (4, 0x20), (5, 0x01), (5, 0x08))}
+    self._init(1)
+    for allowed in (False, True):
+      self.safety.set_controls_allowed(allowed)
+      for long_active in (False, True):
+        for gas in (False, True):
+          frames = {0x117: fc.create_long_status(long_active, gas, gear_req=0, counter=3)[1],
+                    0x118: fc.create_long_esp_handshake(long_active, gas, counter=3)[1]}
+          for addr, dat in frames.items():
+            with self.subTest(addr=hex(addr), allowed=allowed, long_active=long_active, gas=gas):
+              self.assertTrue(self._tx(addr, dat))                # what openpilot sends goes out
+              for byte, mask in forbidden[addr]:
+                bad = bytearray(dat)
+                bad[byte] |= mask
+                self.assertFalse(self._tx(addr, bad), f"byte {byte} mask {mask:#x}")
+
+  def test_long_relay_off_without_long_flag(self):
+    self._init(0)
+    self.safety.set_timer(1_000_000)
+    for addr in (0x121, 0x117, 0x118):
+      self.assertFalse(self._tx(addr, bytearray(8)))           # not in the TX list
+      self.assertEqual(self.safety.safety_fwd_hook(2, addr), 0)
 
 
 if __name__ == "__main__":
