@@ -178,6 +178,36 @@ class TestSteeringHandover(unittest.TestCase):
     controller.update(cc.as_reader(), cc_sp, cs, 0)
     assert not controller._angle_override_latch                      # -> resume
 
+  def test_model_target_leading_the_wheel_is_not_an_override(self):
+    # On-vehicle 2026-11-14: in signalled low-speed turns the model's target ran > ANGLE_OVERRIDE_DEG ahead of
+    # the wheel while the wheel was following our rate-limited command, and the latch handed every turn back to
+    # the driver. Only a wheel far from what we commanded too is the driver steering.
+    cp, sp, cs = _make_car()
+    controller = CarController(DBC[CAR.FISKER_OCEAN], cp, sp)
+    controller.secoc_key_verified = True
+    controller.secoc_key = bytes(16)
+    cc_sp = structs.CarControlSP()
+    cc_sp.mads.active = True
+    controller.was_lat_engaged_prev = True
+    controller.was_lat_active_prev = True
+    controller.was_tx_lateral_prev = True
+    controller.engage_delay_remaining = 0
+    cs.eps_lat_sts = 2
+    cc = structs.CarControl(latActive=True)
+
+    controller.apply_angle_last = -40.0                                # our command so far, walking into the turn
+    cs.out = structs.CarState(steeringAngleDeg=-35.0, vEgoRaw=3.0)    # wheel following it, 5 deg behind
+    cc.actuators.steeringAngleDeg = -40.0 - ANGLE_OVERRIDE_DEG - 30.0  # model's target 65 deg ahead of the wheel
+    _, frames = controller.update(cc.as_reader(), cc_sp, cs, 0)
+    assert not controller._angle_override_latch
+    assert LAT_CANDIDATE_ADDR in {addr for addr, _, bus in frames if bus == LAT_CANDIDATE_BUS}  # still steering
+    assert controller.apply_angle_last < -40.0                        # and still walking toward the target
+
+    # the driver yanks the wheel the other way, far from both: that is an override
+    cs.out.steeringAngleDeg = controller.apply_angle_last + ANGLE_OVERRIDE_DEG + 10.0
+    controller.update(cc.as_reader(), cc_sp, cs, 0)
+    assert controller._angle_override_latch
+
   def test_torque_override_yields_below_eps_threshold(self):
     car = _make_car()
     # The EPS's own intervention bit only trips at ~6.5 Nm. We yield proactively at

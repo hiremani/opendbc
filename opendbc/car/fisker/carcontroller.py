@@ -403,8 +403,14 @@ class CarController(CarControllerBase):
     # torque yield missed because the EPS was assisting). Yield instead of commanding into it.
     # Latch with hysteresis so it holds through the maneuver and clears once the wheel is back
     # near the command.
+    # Trip only when the wheel is far from BOTH the model's target and what we actually commanded last tick
+    # (apply_angle_last, rate-limited). In a sharp turn the model's target runs well ahead of the rate-limited
+    # command and the wheel follows the command; that is us steering, not the driver (on-vehicle 2026-11-14, four
+    # signalled low-speed turns handed back mid-turn). A driver turning past our command still trips. Release stays
+    # on the target: while latched apply_angle_last is glued to the wheel, so it can't tell when the driver is done.
     angle_diverge = abs(CS.out.steeringAngleDeg - desired_angle_deg)
-    if angle_diverge > ANGLE_OVERRIDE_DEG:
+    command_diverge = abs(CS.out.steeringAngleDeg - self.apply_angle_last)
+    if angle_diverge > ANGLE_OVERRIDE_DEG and command_diverge > ANGLE_OVERRIDE_DEG:
       self._angle_override_latch = True
     elif angle_diverge < ANGLE_OVERRIDE_RELEASE_DEG:
       self._angle_override_latch = False
