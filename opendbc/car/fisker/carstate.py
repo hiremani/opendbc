@@ -19,6 +19,7 @@ from opendbc.car.fisker.values import (
 ButtonType = structs.CarState.ButtonEvent.Type
 GearShifter = structs.CarState.GearShifter
 
+BLINKER_HOLD_FRAMES = 50   # carstate updates (100 Hz) a blinker lamp stays "on" after its last lit frame
 TSR_LIMIT_INVALID = 250   # ADAS_TSRSpeedLimit at or above this is not a limit (255 = invalid in the FM29 matrix)
 
 # VCU_GearSig values from DBC VAL_ table
@@ -441,9 +442,12 @@ class CarState(CarStateBase):
     ret.seatbeltUnlatched = cp_pt.vl["ACU_0x159"]["ACU_BucSwtStFrntDrvr"] == 1
 
     # ---- Blinkers ----
+    # The BCM sends the lamp output, which follows the flash; held over the dark half of each flash (50 updates =
+    # 0.5 s at 100 Hz, as Hyundai and Subaru do) so blinker features see the stalk, not the bulb. On 2026-11-14 the raw
+    # lamp state toggled the lane-turn desire with every flash and broke its end-of-turn logic.
     bcm335 = cp_pt.vl["BCM_0x335"]
-    ret.leftBlinker = bool(bcm335["BCM_LeTrunLampOutpCmd"])
-    ret.rightBlinker = bool(bcm335["BCM_RiTrunLampOutpCmd"])
+    ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_lamp(BLINKER_HOLD_FRAMES, bool(bcm335["BCM_LeTrunLampOutpCmd"]),
+                                                                      bool(bcm335["BCM_RiTrunLampOutpCmd"]))
 
     # ---- Blind spot monitoring ----
     # BSM is authored by the OEM ADAS module on the cam-side bus (Bus.cam = bus 2).

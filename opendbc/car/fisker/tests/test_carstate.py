@@ -258,3 +258,20 @@ class TestTsrSpeedLimit(unittest.TestCase):
     msg = packer.make_can_msg("ADAS_0x311", CANBUS.cam, {"ADAS_TSRSpeedLimit": 40, "ADAS_SpeedLimitUnit": 1})
     parsers[Bus.cam].update([(0, [msg])])
     self.assertAlmostEqual(CarState.tsr_speed_limit(parsers[Bus.cam].vl["ADAS_0x311"]), 40 * CV.MPH_TO_MS)
+
+
+class TestBlinkerHold(unittest.TestCase):
+  """The BCM's turn-lamp command follows the flash; carState must report the stalk, held over the dark half."""
+
+  def test_flashing_lamp_reads_as_steady_blinker(self):
+    from opendbc.car.fisker.carstate import BLINKER_HOLD_FRAMES
+    cp = CarInterface.get_non_essential_params(CAR.FISKER_OCEAN)
+    sp = CarInterface.get_non_essential_params_sp(cp, CAR.FISKER_OCEAN)
+    cs = CarState(cp, sp)
+    seen = []
+    for frame in range(300):                        # ~1.5 Hz flash: 33 frames lit, 33 dark
+      lit = (frame // 33) % 2 == 0
+      seen.append(cs.update_blinker_from_lamp(BLINKER_HOLD_FRAMES, lit, False)[0])
+    self.assertTrue(all(seen))
+    off = [cs.update_blinker_from_lamp(BLINKER_HOLD_FRAMES, False, False)[0] for _ in range(BLINKER_HOLD_FRAMES + 1)]
+    self.assertFalse(off[-1])                       # and it does go off once the stalk is released
