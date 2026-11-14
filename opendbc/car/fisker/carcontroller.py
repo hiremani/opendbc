@@ -406,7 +406,7 @@ class CarController(CarControllerBase):
     # Trip only when the wheel is far from BOTH the model's target and what we actually commanded last tick
     # (apply_angle_last, rate-limited). In a sharp turn the model's target runs well ahead of the rate-limited
     # command and the wheel follows the command; that is us steering, not the driver (on-vehicle 2026-11-14, four
-    # signalled low-speed turns handed back mid-turn). A driver turning past our command still trips. Release stays
+    # signaled low-speed turns handed back mid-turn). A driver turning past our command still trips. Release stays
     # on the target: while latched apply_angle_last is glued to the wheel, so it can't tell when the driver is done.
     angle_diverge = abs(CS.out.steeringAngleDeg - desired_angle_deg)
     command_diverge = abs(CS.out.steeringAngleDeg - self.apply_angle_last)

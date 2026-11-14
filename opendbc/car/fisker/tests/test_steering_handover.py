@@ -179,7 +179,7 @@ class TestSteeringHandover(unittest.TestCase):
     assert not controller._angle_override_latch                      # -> resume
 
   def test_model_target_leading_the_wheel_is_not_an_override(self):
-    # On-vehicle 2026-11-14: in signalled low-speed turns the model's target ran > ANGLE_OVERRIDE_DEG ahead of
+    # On-vehicle 2026-11-14: in signaled low-speed turns the model's target ran > ANGLE_OVERRIDE_DEG ahead of
     # the wheel while the wheel was following our rate-limited command, and the latch handed every turn back to
     # the driver. Only a wheel far from what we commanded too is the driver steering.
     cp, sp, cs = _make_car()
