@@ -329,7 +329,7 @@ class TestFiskerHooks(unittest.TestCase):
 
   ANGLE_ZERO = 12480
   ACCEL_INACTIVE = 32773
-  ACCEL_MAX = 36870
+  ACCEL_MAX = 34822   # +1.0 m/s^2
   LAT_RELAY_TIMEOUT_US = 60_000
 
   def setUp(self):

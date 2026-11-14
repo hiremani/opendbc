@@ -48,3 +48,19 @@ class TestLongFrames(unittest.TestCase):
     assert CarInterface.get_pid_accel_limits(None, None, 10.0, 20.0) == (CarControllerParams.ACCEL_MIN, 1.0)
     d = make().create_accel_command(CarControllerParams.ACCEL_MAX, True, 0)[1]
     assert (d[2] << 8) | d[3] == 34822   # FISKER_ACCEL_MAX in safety/modes/fisker.h
+
+  def test_panda_accel_limits_match_python(self):
+    # Read the panda's own #defines, so its cap can't drift from ours again: it was left at +2.0 m/s^2 after the
+    # Python cap dropped to 1.0, and nothing failed (the safety test asserted the C value, this one the Python).
+    import os
+    import re
+    from opendbc.car.fisker.values import CarControllerParams
+    header = os.path.join(os.path.dirname(__file__), "..", "..", "..", "safety", "modes", "fisker.h")
+    with open(header) as f:
+      defines = dict(re.findall(r"#define (FISKER_ACCEL_\w+)\s+(\d+)", f.read()))
+    fc = make()
+    for name, accel, active in (("FISKER_ACCEL_MAX", CarControllerParams.ACCEL_MAX, True),
+                                ("FISKER_ACCEL_MIN", CarControllerParams.ACCEL_MIN, True),
+                                ("FISKER_ACCEL_INACTIVE", 0.0, False)):
+      d = fc.create_accel_command(accel, active, 0)[1]
+      assert int(defines[name]) == (d[2] << 8) | d[3], name

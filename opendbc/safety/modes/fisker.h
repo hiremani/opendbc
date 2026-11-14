@@ -161,7 +161,7 @@ static bool fisker_cand_armed(void) {
 
 // Accel: raw CAN at 0.0004882 m/s^2/LSB, offset -16 m/s^2. raw = (accel + 16) / 0.0004882
 #define FISKER_ACCEL_INACTIVE 32773  //  0.0 m/s^2
-#define FISKER_ACCEL_MAX      36870  // +2.0 m/s^2
+#define FISKER_ACCEL_MAX      34822  // +1.0 m/s^2, = CarControllerParams.ACCEL_MAX (values.py); test_long_frames checks they agree
 #define FISKER_ACCEL_MIN      25604  // -3.5 m/s^2
 
 
