@@ -13,7 +13,7 @@ from opendbc.car import structs
 from opendbc.car.fisker import carcontroller, fiskercan
 from opendbc.car.fisker.fiskercan import FiskerCAN
 from opendbc.car.fisker.interface import CarInterface
-from opendbc.car.fisker.values import CANBUS, CAR, ICC_0x35B_OVERRIDES, ICC_0x35B_PASSTHROUGH
+from opendbc.car.fisker.values import CANBUS, CAR, ICC_0x35B_MOMENTARY, ICC_0x35B_OVERRIDES, ICC_0x35B_PASSTHROUGH
 
 DBC_NAME = "fisker_ocean_adas"
 MSG = "ICC_0x35B"
@@ -55,6 +55,20 @@ class TestIcc0x35b(unittest.TestCase):
       for sig, raw in cfg.items():
         assert sig in SIGNALS, sig
         assert 0 <= raw < (1 << SIGNALS[sig].size), sig
+
+  def test_no_momentary_action_in_defaults(self):
+    # APA start, park-out start and slot select are one-shot user actions. A default override would
+    # hold one asserted on every relayed frame.
+    assert ICC_0x35B_MOMENTARY == {"ICC_APAParkSelect", "ICC_APAActivation", "ICC_APAParkOutAct"}
+    assert ICC_0x35B_MOMENTARY <= SIGNALS.keys()
+    assert not (ICC_0x35B_OVERRIDES.keys() & ICC_0x35B_MOMENTARY)
+
+  def test_momentary_actions_pass_through(self):
+    fcan = FiskerCAN(None, CANPacker(DBC_NAME))
+    for src in decode(RANDOM_FRAMES):
+      out = decode([fcan.create_icc_0x35b(src)[1]], bus=CANBUS.cam)[0]
+      for sig in ICC_0x35B_MOMENTARY:
+        assert out[sig] == src[sig], sig
 
   @patch.object(fiskercan, "ICC_0x35B_OVERRIDES", EXAMPLE_OVERRIDES)
   def test_create_icc_0x35b(self):

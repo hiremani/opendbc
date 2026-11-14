@@ -23,7 +23,9 @@ ACCEL_CAN_ID = 0x121
 # Phone-over-wifi remote-control gating. See
 # openpilot/sunnypilot/selfdrive/remote_control/remote_control_server.py for
 # the Params producer. All three are CLEAR_ON_MANAGER_START so a reboot
-# always comes up with the app disabled.
+# always comes up with the app disabled. RemoteControlEnabled is the owner's
+# opt-in: manager only runs the server while it is set, and the server only
+# writes a fresh angle after a client has armed it.
 #   * stale after this long: carcontroller falls back to sunnypilot's planner.
 #     Chosen to be ~10× the server's command interval (~33 ms @ 30 Hz) so a
 #     single dropped packet is survivable but a dead wifi link disengages
@@ -690,24 +692,26 @@ class CarController(CarControllerBase):
     # ---- Longitudinal (accel 0x121 + status 0x117/0x118 @ 100 Hz) ----
     # Same architecture as lateral (see comment above): send the whole triple across the
     # WHOLE engaged window so the VCU/ESP never see the ADAS heartbeat vanish. Content
-    # modulates on state:
-    #   engaged + long_active + not gas_override: Sts=Active(3) + Typ=ACC(1), AccelVld=1,
-    #                                             AccelReq = openpilot's commanded accel
-    #   engaged + gas_override:                    Sts=Active(3) + Typ=ACC(1), AccelVld=1,
-    #                                             AccelReq = 0 (yield to driver pedal —
-    #                                             the VCU arbitrates pedal vs request)
-    #   engaged + !long_active:                    Sts=Active(3) + Typ=ACC(1) but
-    #                                             AccelVld=0 (idle heartbeat)
-    #   !engaged:                                   frames not sent (nothing on bus 2 to
-    #                                             forward on this trim, but if the OEM
-    #                                             ADAS SW is ever restored it will get
-    #                                             through and Sts=Off/Typ=Not_Active)
+    # modulates on state (what fiskercan.create_long_status / create_long_esp_handshake /
+    # create_accel_command actually pack; ADAS_LgtCtrl_Typ: 0=Not_Active 1=ACC 2=ACC_Stop_and_Go):
+    #   long_active + not gas_override: 0x117/0x118 Sts=Active(3), Typ=ACC_Stop_and_Go(2);
+    #                                   AccelVld=1, AccelReq = openpilot's commanded accel
+    #   long_active + gas_override:     0x117/0x118 Sts=Active(3), Typ=ACC_Stop_and_Go(2),
+    #                                   DrvrOvrdSts=1; AccelVld=0, AccelReq=0 (yield to the
+    #                                   driver's pedal)
+    #   !long_active (idle heartbeat):  0x117/0x118 Sts=Off(0), Typ=Not_Active(0); AccelVld=0,
+    #                                   AccelReq=0. Sent while engaged, and from then on once
+    #                                   openpilot has been long-active in this drive.
+    #   never engaged yet:              frames not sent
+    # Typ=ACC(1) is never sent. Whether the VCU honors a negative AccelReq (decel authority)
+    # with Typ=2 is UNVERIFIED on-vehicle; see create_long_status.
     #
-    # NOTE: the CC->ACC transition is a value change (Sts 0->3) INSIDE this continuous
-    # stream — it is not a one-shot event message. The VCU is designed to hand accel
-    # control to the ADAS the moment it sees Sts=Active + Typ=ACC on 0x117.
+    # NOTE: the CC->ACC transition is a value change (Sts 0->3, Typ 0->2) INSIDE this
+    # continuous stream — it is not a one-shot event message.
     if self.CP.openpilotLongitudinalControl:
-      long_active = CC.longActive and secoc_ok
+      # The VCU withdrew VCU_ACCRdy mid-engagement (carstate.vcu_acc_rdy_lost): it is not taking
+      # our requests, so fall back to the idle heartbeat. accFaulted disengages openpilot as well.
+      long_active = CC.longActive and secoc_ok and not CS.vcu_acc_rdy_lost
       gas_override = CS.out.gasPressed         # driver commanding accel via pedal
       accel_active = long_active and not gas_override
       accel = 0.0 if not accel_active else float(np.clip(actuators.accel,
@@ -720,11 +724,11 @@ class CarController(CarControllerBase):
       # never has a gap and the ESP never sees 0x118 (AEB state) disappear. Idle values
       # (long_active=False -> Sts=Off, AccelVld=Init) mimic what a real ADAS would publish
       # when powered but not commanding.
-      # Braking authorization: VCU-side ACC deceleration requires ADAS_LgtCtrl_Typ=TJA/ICA
-      # (= value 2, ACC_Stop_and_Go). That's set inside create_long_status when long_active
-      # is True — no per-frame gating needed here. ISA_CutOffReq is a separate Speed-Limit
-      # mechanism that requires driver-activated Speed Limiter mode; not the path openpilot
-      # needs.
+      # Deceleration: create_long_status sends ADAS_LgtCtrl_Typ=2 (ACC_Stop_and_Go) whenever
+      # long_active is True, on the working assumption that the VCU ignores a negative
+      # AccelReq under Typ=1 (ACC) — no per-frame gating needed here. Decel authority with
+      # Typ=2 is unverified on-vehicle. ISA_CutOffReq is a separate Speed-Limit mechanism that
+      # requires driver-activated Speed Limiter mode; not the path openpilot needs.
 
       if engaged or self.long_ever_active:
         # 0x121 accel command (SecOC)

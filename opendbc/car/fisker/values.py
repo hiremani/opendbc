@@ -20,8 +20,8 @@ class FiskerCarDocs(CarDocs):
 class FiskerPlatformConfig(PlatformConfig):
   # Everything openpilot needs is on ADASBUS — the gateway mirrors the body/HMI
   # signals (gear, pedal, doors, seatbelt, blinkers, MFSS buttons) onto it — so
-  # the port taps a single bus. fisker_ocean_body remains in opendbc/dbc for
-  # reference but is not wired into a CAN parser.
+  # the car state comes from a single DBC (there is no separate body DBC). The
+  # radar tracks come from the MRR's own link on panda bus 1.
   dbc_dict: DbcDict = field(default_factory=lambda: {
     Bus.pt: 'fisker_ocean_adas',
     # Mid-range radar private link, panda bus 1. Reverse-engineered; see the DBC's comments.
@@ -177,7 +177,6 @@ ICC_0x35B_OVERRIDES: dict[str, int] = {
   #                                 #   3=ON_with_visual_and_audio_and_Steering_Wheel_Vibration
   # "ICC_LKA_SettingWrnTyp": 1,     # 0=Audio_Visual_and_Haptic 1=Visual_and_Audio
   "ICC_SteerWhlVibrSet": 1,       # 0=Off 1=On
-  "ICC_APAActivation": 1,          # 0=Off 1=On
   "ICC_APA_Setting": 2,           # 0=Coded_off_(not_equipped) 1=Off_(by_user) 2=Enabled
   "ICC_APAParkInDirSetting": 1,   # 0=Nose-in 1=Back-in
   "ICC_APAParkOutDirSetting": 1,  # 0=Right 1=Left
@@ -187,8 +186,18 @@ ICC_0x35B_OVERRIDES: dict[str, int] = {
   "ICC_TP_Setting": 1,            # 0=Trained_Parking_Disabled 1=Trained_Parking_Enabled
   # Also in this frame but momentary user actions, not settings — overriding one holds it
   # asserted on every frame: ICC_APAParkSelect (slot), ICC_APAActivation (1=On starts APA),
-  # ICC_APAParkOutAct (1=Request starts park-out).
+  # ICC_APAParkOutAct (1=Request starts park-out). They are listed in ICC_0x35B_MOMENTARY and
+  # must never be a default here.
 }
+
+# Momentary user actions in ICC_0x35B (see above). Not allowed in the code defaults; the ICC's
+# own value passes through unless someone sets one live from the web HUD.
+ICC_0x35B_MOMENTARY = frozenset({
+  "ICC_APAParkSelect",
+  "ICC_APAActivation",
+  "ICC_APAParkOutAct",
+})
+assert not (ICC_0x35B_OVERRIDES.keys() & ICC_0x35B_MOMENTARY), "ICC_0x35B momentary actions can't be default overrides"
 
 # Live user interactions with the camera view — always passed through from the ICC's frame.
 ICC_0x35B_PASSTHROUGH = frozenset({

@@ -175,8 +175,8 @@ class FiskerCAN:
     """ADAS_0x121 — longitudinal accel request, 10 ms cycle. SecOC-protected.
     `accel_active` gates the wire-level Vld — 1(Valid) while we're actually commanding,
     0(Initializing) otherwise so the VCU ignores the request while we're disengaged/idle.
-    Callers should pass accel=0.0 during driver gas override (we still send Vld=1 to keep
-    a valid heartbeat, but request zero acceleration so the VCU can arbitrate the pedal)."""
+    During a driver gas override the carcontroller passes accel=0.0 and accel_active=False,
+    so that frame is Vld=0 with a zero request, same as the idle heartbeat."""
     values = {
       "ADAS_LgtCtrl_AccelReq": accel,
       "ADAS_LgtCtrl_AccelVld": 1 if accel_active else 0,
@@ -192,18 +192,22 @@ class FiskerCAN:
                          gear_req: int, counter: int):
     """ADAS_0x117 — long-control status + parking gear request, 10 ms cycle (plain E2E).
 
-    The VCU only applies a NEGATIVE ADAS_LgtCtrl_AccelReq (on 0x121) when ALL of these
-    conditions hold simultaneously:
+    What is sent (ADAS_LgtCtrl_Typ DBC values: 0=Not_Active 1=ACC 2=ACC_Stop_and_Go):
+      long_active:      Sts=3 (Active), Typ=2 (ACC_Stop_and_Go)
+      not long_active:  Sts=0 (Off),    Typ=0 (Not_Active)
+    Typ=1 (ACC) is never sent.
+
+    Why Typ=2: on-vehicle testing with Typ=1 (ACC) found the VCU accepted the POSITIVE portion
+    of AccelReq (motor torque add) but silently ignored negatives. The working assumption is
+    that the VCU only applies a NEGATIVE ADAS_LgtCtrl_AccelReq (on 0x121) when ALL of these
+    hold simultaneously:
       - ADAS_LgtCtrl_Sts      = 3 (Active)
       - ADAS_LgtCtrl_StsVld   = 1 (Valid)
-      - ADAS_LgtCtrl_Typ      = TJA/ICA (= value 2, ACC_Stop_and_Go — the only Typ that
-                                is a superset of plain ACC with stop-and-go capability)
+      - ADAS_LgtCtrl_Typ      = 2 (ACC_Stop_and_Go)
       - ADAS_LgtCtrl_AccelVld = 1 (Valid, on 0x121)
       - ADAS_LgtCtrl_AccelReq within the accepted range (deeper decel gets clamped)
-
-    On-vehicle testing with Typ=1 (plain ACC) confirmed the VCU accepted the POSITIVE
-    portion of AccelReq (motor torque add) but silently ignored negatives — the wrong
-    Typ blocks the decel path.
+    UNVERIFIED on-vehicle: that the VCU actually decelerates on a negative request with Typ=2
+    (decel authority) has not been confirmed from a drive log.
 
     ADAS_ISA_CutOffReq is left at 0 here.  It's the entry point of a different mechanism
     (Speed Limit control via ISA subsystem), not the ACC path.
@@ -236,10 +240,10 @@ class FiskerCAN:
     """ADAS_0x118 — ESP/long handshake, 10 ms cycle (plain E2E).
     Same Sts=3(Active) fix as 0x117 (was 1=Reserved). All Vld fields set to 1(Valid) so
     the ESP considers each optional request signal explicitly present as No_request rather
-    than 'value uninitialized, ignore me'. Braking authorization on this trim is done
-    entirely VCU-side (motor torque cut via ADAS_ISA_CutOffReq on 0x117); we intentionally
-    do NOT assert JerkReq / BrkPrefillReq / HBAReq / AEB here to keep hydraulic brakes out
-    of the loop."""
+    than 'value uninitialized, ignore me'. Any deceleration on this trim is expected to come
+    from the VCU (a negative AccelReq on 0x121 with Typ=2 on 0x117, unverified on-vehicle;
+    ADAS_ISA_CutOffReq stays 0); we intentionally do NOT assert JerkReq / BrkPrefillReq /
+    HBAReq / AEB here to keep hydraulic brakes out of the loop."""
     values = {
       "ADAS_LgtCtrl_ESP_Sts": 3 if long_active else 0,     # 3=Active, 0=Off
       "ADAS_LgtCtrl_ESP_Vld": 1,                            # 1=Valid

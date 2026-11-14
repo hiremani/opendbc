@@ -84,6 +84,13 @@ EPS_HARD_FAULT_DISENGAGE_FRAMES = 3
 # disengages openpilot.
 ACC_FAULT_DEBOUNCE_FRAMES = 50
 
+# openpilot longitudinal only: how many carState updates (~100 Hz) VCU_ACCRdy must read Not_ready,
+# after reading Ready in the same cruise engagement, before we stop commanding accel and report
+# accFaulted. In 000000c6--51d13b87bd--1 the VCU dropped it when the car faulted itself (see
+# CarControllerParams.ACCEL_MAX). A few frames only reject a single bad frame. What the VCU reports
+# during a driver gas override or at standstill is unverified on-vehicle.
+VCU_ACC_RDY_LOST_FRAMES = 5
+
 
 # Every signal in ICC_0x52A. Enumerated once here so carstate snapshots the whole frame
 # and the carcontroller can round-trip it into the spoofed packet with only
@@ -236,6 +243,10 @@ class CarState(CarStateBase):
     self._params = None               # lazily constructed on first write
     self._prev_cc_state = 0           # tracks ADAS_Sts_ACC_ICC for cruise→Off reset edge
     self._acc_failure_frames = 0      # consecutive updates with ACC in a Failure state (9/10)
+    # VCU_ACCRdy watch, openpilot longitudinal only (see VCU_ACC_RDY_LOST_FRAMES). Read by carcontroller.
+    self.vcu_acc_rdy_lost = False
+    self._vcu_acc_rdy_seen = False        # VCU reported Ready during this cruise engagement
+    self._vcu_acc_not_rdy_frames = 0      # consecutive updates Not_ready after that
 
     # Button state edge detection
     self._prev_button_state = {sig: 0 for sig in BUTTON_SIGNAL_TO_TYPE}
@@ -512,6 +523,25 @@ class CarState(CarStateBase):
     ret.cruiseState.speed = vcu_cc_speed if use_vcu else cc_speed
     ret.cruiseState.speedCluster = ret.cruiseState.speed
 
+    # ---- VCU ACC readiness (openpilot longitudinal only) ----
+    # With openpilot longitudinal the VCU acts on our 0x121 requests. If it withdraws VCU_ACCRdy
+    # (VCU_0x214: 0=Not_ready 1=Ready) while cruise is engaged it is no longer taking them, so the
+    # carcontroller stops commanding accel and accFaulted (below) disengages openpilot. Only a drop
+    # counts: Ready has to have been seen in this engagement first. Live, not latched: it clears
+    # when the VCU is Ready again or cruise ends. Without openpilot longitudinal the stock ADAS owns
+    # the VCU handshake and none of this runs.
+    if self.CP.openpilotLongitudinalControl:
+      vcu_acc_rdy = int(vcu["VCU_ACCRdy"]) == 1
+      if not ret.cruiseState.enabled:
+        self._vcu_acc_rdy_seen = False
+        self._vcu_acc_not_rdy_frames = 0
+      elif vcu_acc_rdy:
+        self._vcu_acc_rdy_seen = True
+        self._vcu_acc_not_rdy_frames = 0
+      elif self._vcu_acc_rdy_seen:
+        self._vcu_acc_not_rdy_frames += 1
+      self.vcu_acc_rdy_lost = self._vcu_acc_not_rdy_frames >= VCU_ACC_RDY_LOST_FRAMES
+
     # ---- Buttons (MFSS) ----
     # Edge-detect per signal with a signal-specific "is pressed" predicate so that e.g.
     # MFS_RiBtnSouth short press (used by the car for the ACC follow-distance adjustment)
@@ -564,8 +594,10 @@ class CarState(CarStateBase):
     # ---- Faults ----
     # ADAS_Sts_ACC_ICC 9/10 = Failure_reversible/irreversible (same enum position as
     # the old VCU_Sts_CC_ICC path — the fault codes carry the same meaning across
-    # both authors). Debounced and gear-gated as above.
-    ret.accFaulted = acc_failure_confirmed or bool(cp_pt.vl["ESP_0x114"]["ESP_FltIndcn_AEB"])
+    # both authors). Debounced and gear-gated as above. vcu_acc_rdy_lost is only ever set with
+    # openpilot longitudinal (see above).
+    ret.accFaulted = (acc_failure_confirmed or bool(cp_pt.vl["ESP_0x114"]["ESP_FltIndcn_AEB"])
+                      or self.vcu_acc_rdy_lost)
 
     # ---- OEM ADAS lateral counters (bus 2, for takeover alignment) --------
     # Snapshot the OEM ADAS's own AliveCounter and SSecOC_Fresh_Byte0 from bus 2. The
