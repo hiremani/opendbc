@@ -257,6 +257,13 @@ BO_ 532 VCU_0x214: 16 GW
  SG_ VCU_214_SSecOC_MAC_Byte1 : 87|8@0+ (1,0) [0|255] ""  ADASBUS_Virtual_ECU
  SG_ VCU_214_SSecOC_MAC_Byte2 : 95|8@0+ (1,0) [0|255] ""  ADASBUS_Virtual_ECU
 
+BO_ 785 ADAS_0x311: 8 ADAS
+ SG_ ADAS_311_CheckSum : 7|8@0+ (1,0) [0|255] ""  GW
+ SG_ ADAS_311_AliveCounter : 11|4@0+ (1,0) [0|14] ""  GW
+ SG_ ADAS_SpeedLimitUnit : 30|1@0+ (1,0) [0|1] ""  GW
+ SG_ ADAS_ISA_SpdLmt : 39|8@0+ (1,0) [0|255] "kph"  GW
+ SG_ ADAS_TSRSpeedLimit : 55|8@0+ (1,0) [0|255] ""  GW
+
 BO_ 787 ADAS_0x313: 8 ADAS
  SG_ ADAS_313_CheckSum : 7|8@0+ (1,0) [0|255] ""  FCM,GW
  SG_ ADAS_313_AliveCounter : 11|4@0+ (1,0) [0|14] ""  FCM,GW
@@ -753,6 +760,8 @@ CM_ SG_ 532 VCU_214_SSecOC_MAC_Byte0 "Short SecOC MAC signal byte 0 on CAN";
 CM_ SG_ 532 VCU_214_SSecOC_MAC_Byte1 "Short SecOC MAC signal byte 1 on CAN";
 CM_ SG_ 532 VCU_214_SSecOC_MAC_Byte2 "Short SecOC MAC signal byte 2 on CAN";
 Resolution should be 360/254 degrees";
+CM_ BO_ 785 "Traffic sign recognition: the speed limit the ADAS shows (subset of the FM29 matrix; 50 Hz on route 000000e3)";
+CM_ SG_ 785 ADAS_TSRSpeedLimit "Recognised speed limit in the unit ADAS_SpeedLimitUnit names; 0 = none";
 CM_ BO_ 787 "Messages for ICC (IBUS 2) and Event Data Recorder (Chassis Bus)";
 CM_ SG_ 787 ADAS_313_CheckSum "ADAS_313_Message checksum  ( E2E data ID: 0x4B)";
 CM_ SG_ 787 ADAS_313_AliveCounter "ADAS_313_Message counter";
@@ -3269,6 +3278,7 @@ VAL_ 532 VCU_BrkSigVld 0 "Initializing" 1 "Valid" 2 "Invalid" 3 "Reserved" ;
 VAL_ 532 VCU_DrvModSigFb 0 "Eco" 1 "Normal" 2 "Sport" 3 "Custom" 4 "Snow" 5 "Offroad" 6 "Valet" 7 "Invalid" ;
 VAL_ 532 VCU_DrvModShiftMisoper 0 "Normal" 1 "Abnormal" ;
 VAL_ 532 VCU_SpclTerrainModEnaSig 0 "Not_enabled" 1 "Enable" ;
+VAL_ 785 ADAS_SpeedLimitUnit 0 "KPH" 1 "MPH" ;
 VAL_ 787 ADAS_FACM_Sts 0 "UaCMX" 1 "DsblCMX" 2 "StdbyCMX" 3 "StdbyDgrdCMX" 4 "ActvCMX" 5 "ActvDgrdCMX" 6 "ErrCMX" 7 "ActvDgrd1CMX" 8 "ActvDgrd2CMX" 9 "DsblDgrdCMX" 10 "Reserved" 11 "Reserved" 12 "Reserved" 13 "Reserved" 14 "Reserved" 15 "Reserved" ;
 VAL_ 787 ADAS_BACM_Sts 0 "UaCMX" 1 "DsblCMX" 2 "StdbyCMX" 3 "StdbyDgrdCMX" 4 "ActvCMX" 5 "ActvDgrdCMX" 6 "ErrCMX" 7 "ActvDgrd1CMX" 8 "ActvDgrd2CMX" 9 "DsblDgrdCMX" 10 "Reserved" 11 "Reserved" 12 "Reserved" 13 "Reserved" 14 "Reserved" 15 "Reserved" ;
 VAL_ 787 AEB_ReAEB_Sts 0 "UaCMX" 1 "DsblCMX" 2 "StdbyCMX" 3 "StdbyDgrdCMX" 4 "ActvCMX" 5 "ActvDgrdCMX" 6 "ErrCMX" 7 "ActvDgrd1CMX" 8 "ActvDgrd2CMX" 9 "DsblDgrdCMX" 10 "Reserved" 11 "Reserved" 12 "Reserved" 13 "Reserved" 14 "Reserved" 15 "Reserved" ;

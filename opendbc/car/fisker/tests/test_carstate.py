@@ -238,3 +238,23 @@ class TestCarstate(unittest.TestCase):
     # not jump to 65 (= 64 + 1), which was the +64 bug.
     restart = _feed_1d0(CS, parsers, packer, [(1, 3), (2, 3), (3, 3)])
     assert restart == [1, 2, 3], restart
+
+
+class TestTsrSpeedLimit(unittest.TestCase):
+  """carStateSP.speedLimit from the car's own traffic sign recognition (ADAS_0x311)."""
+
+  def test_units_and_no_limit(self):
+    limit = CarState.tsr_speed_limit
+    self.assertAlmostEqual(limit({"ADAS_TSRSpeedLimit": 25, "ADAS_SpeedLimitUnit": 1}), 25 * CV.MPH_TO_MS)
+    self.assertAlmostEqual(limit({"ADAS_TSRSpeedLimit": 50, "ADAS_SpeedLimitUnit": 0}), 50 * CV.KPH_TO_MS)
+    for none in (0, 250, 255):
+      self.assertEqual(limit({"ADAS_TSRSpeedLimit": none, "ADAS_SpeedLimitUnit": 1}), 0.0)
+
+  def test_frame_on_the_cam_bus_reaches_car_state_sp(self):
+    cp = CarInterface.get_non_essential_params(CAR.FISKER_OCEAN)
+    sp = CarInterface.get_non_essential_params_sp(cp, CAR.FISKER_OCEAN)
+    parsers = CarState.get_can_parsers(cp, sp)
+    packer = CANPacker(DBC[CAR.FISKER_OCEAN][Bus.pt])
+    msg = packer.make_can_msg("ADAS_0x311", CANBUS.cam, {"ADAS_TSRSpeedLimit": 40, "ADAS_SpeedLimitUnit": 1})
+    parsers[Bus.cam].update([(0, [msg])])
+    self.assertAlmostEqual(CarState.tsr_speed_limit(parsers[Bus.cam].vl["ADAS_0x311"]), 40 * CV.MPH_TO_MS)

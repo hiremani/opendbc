@@ -19,6 +19,8 @@ from opendbc.car.fisker.values import (
 ButtonType = structs.CarState.ButtonEvent.Type
 GearShifter = structs.CarState.GearShifter
 
+TSR_LIMIT_INVALID = 250   # ADAS_TSRSpeedLimit at or above this is not a limit (255 = invalid in the FM29 matrix)
+
 # VCU_GearSig values from DBC VAL_ table
 GEAR_MAP = {
   1: GearShifter.park,
@@ -670,7 +672,19 @@ class CarState(CarStateBase):
     ])
     self.secoc_sync_seen = True
 
+    ret_sp.speedLimit = self.tsr_speed_limit(cp_cam.vl["ADAS_0x311"])
+
     return ret, ret_sp
+
+  @staticmethod
+  def tsr_speed_limit(adas311) -> float:
+    """The speed limit the car's own traffic sign recognition shows, m/s; 0 when it has none. ADAS_TSRSpeedLimit is in
+    the unit ADAS_SpeedLimitUnit names (on route 000000e3 it read 25 with unit MPH while ADAS_ISA_SpdLmt, in km/h,
+    read 40). sunnypilot's Speed Limit Assist takes it as its "car" source."""
+    limit = int(adas311["ADAS_TSRSpeedLimit"])
+    if limit <= 0 or limit >= TSR_LIMIT_INVALID:
+      return 0.0
+    return limit * (CV.MPH_TO_MS if int(adas311["ADAS_SpeedLimitUnit"]) == 1 else CV.KPH_TO_MS)
 
   @staticmethod
   def get_can_parsers(CP, CP_SP):
@@ -712,6 +726,7 @@ class CarState(CarStateBase):
       ("ADAS_0x313", 50),   # ADAS ACC state (ADAS_Sts_ACC_ICC) — authoritative cruise state
       ("ADAS_0x314", 50),   # BSDSts + LKA/ELKA state enums
       ("ADAS_0x315", 20),   # BSD_CID_{Le,Ri}DispReq — blind-spot alert
+      ("ADAS_0x311", 50),   # traffic sign recognition: the speed limit the ADAS shows
       ("ADAS_0x31C", 20),   # ACC HUD — ADAS_AccTrgSpdDisp + ADAS_DispSpdUnit_ACC (set speed)
       # OEM ADAS's lateral commands on bus 2 — we snapshot the AliveCounters and SecOC
       # wire freshness byte so carcontroller can align its transmitted counters to what
