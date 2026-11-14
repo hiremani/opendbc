@@ -103,13 +103,13 @@ class TestVcuAccReady(unittest.TestCase):
   def test_carcontroller_stops_commanding_accel(self):
     CP, CP_SP, CS, parsers, packer = make_carstate(op_long=True)
     feed(CS, parsers, packer, [(ACTIVE, 1)] * 3)
-    assert long_frames(CP, CP_SP, CS) == (3, 2, 1, 0.5)   # Active, ACC_Stop_and_Go, Valid, the request
+    assert long_frames(CP, CP_SP, CS) == (3, 1, 1, 0.5)   # Active, ACC (the stock Typ), Valid, the request
     feed(CS, parsers, packer, [(ACTIVE, 0)] * VCU_ACC_RDY_LOST_FRAMES)
     assert CS.vcu_acc_rdy_lost
     assert long_frames(CP, CP_SP, CS) == (0, 0, 0, 0.0)   # the idle heartbeat: Off, Not_Active, no request
     assert long_frames(CP, CP_SP, CS, long_active=False) == (0, 0, 0, 0.0)
     feed(CS, parsers, packer, [(ACTIVE, 1)])
-    assert long_frames(CP, CP_SP, CS) == (3, 2, 1, 0.5)
+    assert long_frames(CP, CP_SP, CS) == (3, 1, 1, 0.5)
 
 
 if __name__ == "__main__":

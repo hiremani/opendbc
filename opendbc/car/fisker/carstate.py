@@ -192,6 +192,20 @@ class CarState(CarStateBase):
     self._oem_secoc_rflag_last = None   # 0x1D0's own reset flag (byte0 & 3); window-restart key
     self.oem_1d0_reset_flag = 0         # the same flag, for stamping candidates in OEM's window
 
+    # OEM ADAS's own longitudinal counters on 0x121 / 0x117 / 0x118, snapshotted from bus 2.
+    # Only read with openpilot longitudinal (the parser only subscribes to them then). The OEM
+    # ADAS sends all three at 100 Hz in every ACC state; panda's per-message long relay
+    # replaces them with ours, so carcontroller seeds its long counters from these at the
+    # first long frame (OEM_last + 1), the same way the lateral path uses oem_1d0/oem_1c0.
+    # 0x121's SecOC counter is rebuilt from its own fresh byte exactly like 0x1D0's above.
+    self.oem_121_alive = 0
+    self.oem_117_alive = 0
+    self.oem_118_alive = 0
+    self.oem_121_secoc_full_ctr = 0
+    self._oem_121_wraps = 0
+    self._oem_121_wire_last = 0
+    self._oem_121_rflag_last = None
+
     # ICC_0x52A cached values. This is the ICC settings frame we spoof on bus 2 when
     # cruise is engaged: we forward every OEM signal untouched EXCEPT ICCACCFuncTyp
     # (which we force to 2 so the ADAS module treats us as "type-2" ACC). Storing the
@@ -641,6 +655,25 @@ class CarState(CarStateBase):
     self.oem_1d0_reset_flag = cur_rflag
     self.oem_1d0_secoc_full_ctr = self._oem_secoc_wraps * 64 + cur_wire
 
+    # ---- OEM ADAS longitudinal counters (bus 2, openpilot longitudinal only) ----
+    # Same idea as the lateral snapshot above, for 0x121 / 0x117 / 0x118. 0x121's full SecOC
+    # counter uses the same reconstruction as 0x1D0 (window restart keyed on its own reset flag).
+    if self.CP.openpilotLongitudinalControl:
+      oem_121 = cp_cam.vl["ADAS_0x121"]
+      self.oem_121_alive = int(oem_121["ADAS_121_AliveCounter"])
+      self.oem_117_alive = int(cp_cam.vl["ADAS_0x117"]["ADAS_117_AliveCounter"])
+      self.oem_118_alive = int(cp_cam.vl["ADAS_0x118"]["ADAS_118_AliveCounter"])
+      fresh121 = int(oem_121["ADAS_121_SSecOC_Fresh_Byte0"])
+      wire121 = (fresh121 >> 2) & 0x3F
+      rflag121 = fresh121 & 0x3
+      if self._oem_121_rflag_last is None or rflag121 != self._oem_121_rflag_last:
+        self._oem_121_wraps = 0
+      elif wire121 < self._oem_121_wire_last:
+        self._oem_121_wraps += 1
+      self._oem_121_wire_last = wire121
+      self._oem_121_rflag_last = rflag121
+      self.oem_121_secoc_full_ctr = self._oem_121_wraps * 64 + wire121
+
     # ---- EPS lateral status (0x1C2) — snapshot for the spoof --------------
     # EPS publishes this on bus 0 at ~50 Hz. During our MADS engagement we re-emit
     # it on bus 2 with EPS_AdasLatCtrlSts forced to Available (see
@@ -739,6 +772,15 @@ class CarState(CarStateBase):
       ("ADAS_0x1C0", 100),  # ADAS_1C0_AliveCounter
       ("ADAS_0x1D0", 100),  # ADAS_1D0_AliveCounter + ADAS_1D0_SSecOC_Fresh_Byte0
     ]
+    if CP.openpilotLongitudinalControl:
+      # OEM ADAS's longitudinal frames on bus 2, sent at 100 Hz in every ACC state (5 recorded
+      # drives), the same rate as 0x1D0/0x1C0 above. Only subscribed with openpilot longitudinal,
+      # so a steering-only car's canValid can't depend on them.
+      cam_msgs += [
+        ("ADAS_0x121", 100),  # ADAS_121_AliveCounter + ADAS_121_SSecOC_Fresh_Byte0
+        ("ADAS_0x117", 100),  # ADAS_117_AliveCounter
+        ("ADAS_0x118", 100),  # ADAS_118_AliveCounter
+      ]
     return {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], pt_msgs, CANBUS.pt),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], cam_msgs, CANBUS.cam),

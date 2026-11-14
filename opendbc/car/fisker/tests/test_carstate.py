@@ -239,6 +239,42 @@ class TestCarstate(unittest.TestCase):
     restart = _feed_1d0(CS, parsers, packer, [(1, 3), (2, 3), (3, 3)])
     assert restart == [1, 2, 3], restart
 
+  def test_oem_long_counters_parsed_with_openpilot_long(self):
+    # The OEM ADAS's 0x121 / 0x117 / 0x118 on bus 2: carstate snapshots each AliveCounter and
+    # rebuilds 0x121's full SecOC counter (same window rules as 0x1D0) for the long handover.
+    CP = CarInterface.get_non_essential_params(CAR.FISKER_OCEAN)
+    CP.openpilotLongitudinalControl = True
+    CP_SP = CarInterface.get_non_essential_params_sp(CP, CAR.FISKER_OCEAN)
+    CS = CarState(CP, CP_SP)
+    parsers = CS.get_can_parsers(CP, CP_SP)
+    packer = CANPacker(DBC[CAR.FISKER_OCEAN][Bus.pt])
+    full = []
+    # wire 62, 63, wrap to 0, 1 (full 62..65), then a window restart (new reset flag) at wire 1
+    for i, (wire, rflag) in enumerate([(62, 1), (63, 1), (0, 1), (1, 1), (1, 2)]):
+      frames = [
+        packer.make_can_msg("ADAS_0x121", CANBUS.cam, {"ADAS_121_AliveCounter": i,
+                                                       "ADAS_121_SSecOC_Fresh_Byte0": (wire << 2) | rflag}),
+        packer.make_can_msg("ADAS_0x117", CANBUS.cam, {"ADAS_117_AliveCounter": i + 5}),
+        packer.make_can_msg("ADAS_0x118", CANBUS.cam, {"ADAS_118_AliveCounter": i + 9}),
+      ]
+      for cp in parsers.values():
+        cp.update([(0, frames)])
+      CS.update(parsers)
+      assert (CS.oem_121_alive, CS.oem_117_alive, CS.oem_118_alive) == (i, i + 5, i + 9)
+      full.append(CS.oem_121_secoc_full_ctr)
+    assert full == [62, 63, 64, 65, 1], full
+
+  def test_oem_long_messages_not_subscribed_without_openpilot_long(self):
+    # Steering-only: the cam parser must not wait for (or flag stale) the long frames.
+    CS, parsers, packer = make_carstate()
+    assert not CS.CP.openpilotLongitudinalControl
+    msg = packer.make_can_msg("ADAS_0x117", CANBUS.cam, {"ADAS_117_AliveCounter": 7})
+    for cp in parsers.values():
+      cp.update([(0, [msg])])
+    CS.update(parsers)
+    assert CS.oem_117_alive == 0
+    assert not {0x121, 0x117, 0x118} & parsers[Bus.cam].addresses   # vl[] subscribes lazily; carstate never asks
+
 
 class TestTsrSpeedLimit(unittest.TestCase):
   """carStateSP.speedLimit from the car's own traffic sign recognition (ADAS_0x311)."""

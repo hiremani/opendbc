@@ -3,16 +3,20 @@ The 0x121 accel frame openpilot injects (create_accel_command) must encode accel
 ADAS module's scale, carry a valid plain-E2E checksum, and signal AccelVld only while openpilot is
 actually commanding longitudinal — an idle heartbeat (accel_active=False) sends AccelVld=Init so the
 VCU ignores the request. Scale/offset are the DBC's for ADAS_LgtCtrl_AccelReq; the golden raw values
-come from stock frames in drives 000000af--28a9f95752--1 and 000000b4--d0f733ebb2--5. openpilot never
-replaces the stock 0x117/0x118 content beyond its own status frames. The SecOC tail is stamped
-separately (not exercised here).
+come from stock frames in drives 000000af--28a9f95752--1 and 000000b4--d0f733ebb2--5. The 0x117/0x118
+status values per state match what the stock ADAS sends, and the long counters (AliveCounters and
+0x121's SecOC counter) continue the OEM ADAS's own bus-2 streams at the first long frame, then free-run.
 """
 import unittest
 
-from opendbc.can import CANPacker
-from opendbc.car import Bus
+from opendbc.can import CANPacker, CANParser
+from opendbc.car import Bus, structs
+from opendbc.car.fisker.carcontroller import CarController
+from opendbc.car.fisker.carstate import CarState
 from opendbc.car.fisker.fiskercan import FiskerCAN, fisker_plain_checksum
-from opendbc.car.fisker.values import CAR, DBC
+from opendbc.car.fisker.interface import CarInterface
+from opendbc.car.fisker.values import CANBUS, CAR, DBC
+from opendbc.testing import parameterized
 
 
 def make():
@@ -64,3 +68,106 @@ class TestLongFrames(unittest.TestCase):
                                 ("FISKER_ACCEL_INACTIVE", 0.0, False)):
       d = fc.create_accel_command(accel, active, 0)[1]
       assert int(defines[name]) == (d[2] << 8) | d[3], name
+
+
+def decode(addr, data):
+  name = {0x117: "ADAS_0x117", 0x118: "ADAS_0x118", 0x121: "ADAS_0x121"}[addr]
+  parser = CANParser(DBC[CAR.FISKER_OCEAN][Bus.pt], [(name, float('nan'))], CANBUS.pt)
+  parser.update([(0, [(addr, data, CANBUS.pt)])])
+  return parser.vl[name]
+
+
+class TestLongFramesMatchStock(unittest.TestCase):
+  # What the stock ADAS sends (OEM bus-2 frames in 5 recorded drives). 0x117 (Sts, Typ):
+  # ACC Active, braking included, and ACC Override both carry (3, 1); Typ=2 never appears.
+  # 0x118 keeps ESP_Sts=0, StandstillReq=0, StandstillVld=1, JerkReq=0 in every state.
+  @parameterized("long_active, gas, sts, typ", [
+    (True, False, 3, 1),    # openpilot commanding = stock ACC Active
+    (True, True, 3, 1),     # driver on the gas = stock ACC Override
+    (False, False, 0, 0),   # idle heartbeat = stock ACC off
+  ])
+  def test_0x117_and_0x118_match_stock(self, long_active, gas, sts, typ):
+    fc = make()
+    status = decode(*fc.create_long_status(long_active, gas, gear_req=0, counter=4)[:2])
+    assert (status["ADAS_LgtCtrl_Sts"], status["ADAS_LgtCtrl_Typ"]) == (sts, typ)
+    assert status["ADAS_LgtCtrl_DrvrOvrdSts"] == int(gas)
+    esp = decode(*fc.create_long_esp_handshake(long_active, gas, counter=4)[:2])
+    assert esp["ADAS_LgtCtrl_ESP_Sts"] == 0
+    assert esp["ADAS_ESP_StandstillReq"] == 0
+    assert esp["ADAS_ESP_StandstillVld"] == 1
+    assert esp["ADAS_JerkReq"] == 0
+
+  def test_acc_stop_and_go_never_sent(self):
+    fc = make()
+    for long_active in (False, True):
+      for gas in (False, True):
+        assert decode(*fc.create_long_status(long_active, gas, 0, 0)[:2])["ADAS_LgtCtrl_Typ"] != 2
+
+
+def make_long_car():
+  cp = CarInterface.get_non_essential_params(CAR.FISKER_OCEAN)
+  cp.openpilotLongitudinalControl = True
+  cp.secOcKeyAvailable = True
+  sp = CarInterface.get_non_essential_params_sp(cp, CAR.FISKER_OCEAN)
+  cs = CarState(cp, sp)
+  controller = CarController(DBC[CAR.FISKER_OCEAN], cp, sp)
+  controller.secoc_key_verified = True
+  controller.secoc_key = bytes(16)  # synthetic key, no vehicle credentials
+  cs.out = structs.CarState(vEgoRaw=10.)
+  cs.secoc_trip, cs.secoc_reset = 1, 5
+  return controller, cs
+
+
+def long_counters(controller, cs, cruise=True, long_active=True):
+  """One carcontroller tick: {addr: AliveCounter} of the long frames sent, plus 'secoc' = 0x121's wire counter."""
+  cs.out.cruiseState.enabled = cruise
+  _, sends = controller.update(structs.CarControl(longActive=long_active).as_reader(), structs.CarControlSP(), cs, 0)
+  out = {addr: data[1] & 0xF for addr, data, bus in sends if addr in (0x121, 0x117, 0x118) and bus == CANBUS.pt}
+  for addr, data, _bus in sends:
+    if addr == 0x121:
+      out['secoc'] = (data[4] >> 2) & 0x3F
+  return out
+
+
+class TestLongCounters(unittest.TestCase):
+  def test_continue_oem_at_first_frame_then_free_run_skipping_15(self):
+    controller, cs = make_long_car()
+    cs.oem_121_alive, cs.oem_117_alive, cs.oem_118_alive = 13, 14, 5
+    cs.oem_121_secoc_full_ctr = 40
+    assert long_counters(controller, cs, cruise=False, long_active=False) == {}   # not engaged yet: nothing sent
+
+    # First long frame: OEM_last + 1 for every counter (14 + 1 wraps to 0: 15 is never sent).
+    assert long_counters(controller, cs) == {0x121: 14, 0x117: 0, 0x118: 6, 'secoc': 41}
+    # OEM's counters keep moving on bus 2 but we free-run from our own, +1 per frame.
+    cs.oem_121_alive, cs.oem_117_alive, cs.oem_118_alive = 2, 2, 2
+    cs.oem_121_secoc_full_ctr = 7
+    expected = [(0, 1, 7, 42), (1, 2, 8, 43), (2, 3, 9, 44)]
+    for a121, a117, a118, secoc in expected:
+      assert long_counters(controller, cs) == {0x121: a121, 0x117: a117, 0x118: a118, 'secoc': secoc}
+
+  def test_counters_never_reach_15(self):
+    controller, cs = make_long_car()
+    seen = set()
+    for _ in range(40):
+      c = long_counters(controller, cs)
+      seen |= {c[0x121], c[0x117], c[0x118]}
+    assert seen == set(range(15))
+
+  def test_gw_reset_restarts_0x121_secoc_counter(self):
+    controller, cs = make_long_car()
+    cs.oem_121_secoc_full_ctr = 98
+    assert long_counters(controller, cs)['secoc'] == 99 & 0x3F   # only the low 6 bits are on the wire
+    cs.secoc_reset = 6
+    assert long_counters(controller, cs)['secoc'] == 1
+    assert long_counters(controller, cs)['secoc'] == 2
+
+  def test_resnap_after_tx_stops(self):
+    # Long TX stops only while it was never long-active (the heartbeat stays on after that); the
+    # next start continues OEM again.
+    controller, cs = make_long_car()
+    cs.oem_121_alive, cs.oem_117_alive, cs.oem_118_alive = 3, 4, 5
+    assert long_counters(controller, cs, long_active=False) == {0x121: 4, 0x117: 5, 0x118: 6, 'secoc': 1}
+    assert long_counters(controller, cs, cruise=False, long_active=False) == {}
+    cs.oem_121_alive, cs.oem_117_alive, cs.oem_118_alive = 9, 10, 11
+    cs.oem_121_secoc_full_ctr = 20
+    assert long_counters(controller, cs) == {0x121: 10, 0x117: 11, 0x118: 12, 'secoc': 21}

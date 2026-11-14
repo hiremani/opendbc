@@ -193,21 +193,18 @@ class FiskerCAN:
     """ADAS_0x117 — long-control status + parking gear request, 10 ms cycle (plain E2E).
 
     What is sent (ADAS_LgtCtrl_Typ DBC values: 0=Not_Active 1=ACC 2=ACC_Stop_and_Go):
-      long_active:      Sts=3 (Active), Typ=2 (ACC_Stop_and_Go)
+      long_active:      Sts=3 (Active), Typ=1 (ACC)
       not long_active:  Sts=0 (Off),    Typ=0 (Not_Active)
-    Typ=1 (ACC) is never sent.
+    Typ=2 (ACC_Stop_and_Go) is never sent.
 
-    Why Typ=2: on-vehicle testing with Typ=1 (ACC) found the VCU accepted the POSITIVE portion
-    of AccelReq (motor torque add) but silently ignored negatives. The working assumption is
-    that the VCU only applies a NEGATIVE ADAS_LgtCtrl_AccelReq (on 0x121) when ALL of these
-    hold simultaneously:
-      - ADAS_LgtCtrl_Sts      = 3 (Active)
-      - ADAS_LgtCtrl_StsVld   = 1 (Valid)
-      - ADAS_LgtCtrl_Typ      = 2 (ACC_Stop_and_Go)
-      - ADAS_LgtCtrl_AccelVld = 1 (Valid, on 0x121)
-      - ADAS_LgtCtrl_AccelReq within the accepted range (deeper decel gets clamped)
-    UNVERIFIED on-vehicle: that the VCU actually decelerates on a negative request with Typ=2
-    (decel authority) has not been confirmed from a drive log.
+    Why Typ=1: it is what the stock ADAS sends. In 5 recorded drives (OEM 0x117 on bus 2) every
+    frame with stock ACC Active carried Sts=3 Typ=1, while the stock ADAS both accelerated and
+    braked down to -2.16 m/s^2 on 0x121; ACC Override also carried Sts=3 Typ=1, and Typ=2 never
+    appeared. So the VCU takes negative AccelReq under Typ=1. (An earlier version sent Typ=2 on
+    the assumption that the VCU ignored negatives under Typ=1; the stock logs contradict that.)
+
+    Stock inactive values, for comparison: Standby Sts=2 Typ=0, ACC off Sts=0 Typ=0. The idle
+    heartbeat here sends the ACC-off pair (Sts=0 Typ=0) in every inactive state.
 
     ADAS_ISA_CutOffReq is left at 0 here.  It's the entry point of a different mechanism
     (Speed Limit control via ISA subsystem), not the ACC path.
@@ -219,7 +216,7 @@ class FiskerCAN:
       "ADAS_LgtCtrl_StsVld": 1,                            # 1=Valid
       "ADAS_LgtCtrl_DrvrOvrdSts": int(drvr_override),
       "ADAS_LgtCtrl_DrvrOvrdVld": 1,                       # 1=Valid
-      "ADAS_LgtCtrl_Typ": 2 if long_active else 0,         # 2=ACC_Stop_and_Go (=TJA/ICA)
+      "ADAS_LgtCtrl_Typ": 1 if long_active else 0,         # 1=ACC, as the stock ADAS sends
       "ADAS_ISA_CutOffReq": 0,                             # ISA mechanism, not ACC path
       "ADAS_ISA_CutOffReqVld": 1,                          # 1=Valid
       "ADAS_HAP_EmgyStandstillReq": 0,                     # no emergency standstill
@@ -238,14 +235,17 @@ class FiskerCAN:
 
   def create_long_esp_handshake(self, long_active: bool, drvr_override: bool, counter: int):
     """ADAS_0x118 — ESP/long handshake, 10 ms cycle (plain E2E).
-    Same Sts=3(Active) fix as 0x117 (was 1=Reserved). All Vld fields set to 1(Valid) so
-    the ESP considers each optional request signal explicitly present as No_request rather
-    than 'value uninitialized, ignore me'. Any deceleration on this trim is expected to come
-    from the VCU (a negative AccelReq on 0x121 with Typ=2 on 0x117, unverified on-vehicle;
-    ADAS_ISA_CutOffReq stays 0); we intentionally do NOT assert JerkReq / BrkPrefillReq /
-    HBAReq / AEB here to keep hydraulic brakes out of the loop."""
+    Mirrors the stock ADAS: in 5 recorded drives the OEM 0x118 kept ADAS_LgtCtrl_ESP_Sts=0,
+    ADAS_ESP_StandstillReq=0, ADAS_ESP_StandstillVld=1 and ADAS_JerkReq=0 on every frame, in
+    every ACC state, including ACC Active while braking to -2.16 m/s^2. The stock ADAS brakes
+    through the VCU (negative AccelReq on 0x121 with Typ=1 on 0x117), not through this message.
+    So ESP_Sts stays 0 here whether or not openpilot is long-active (it used to be 3 while
+    active, which the stock ADAS never sends); `long_active` is kept for the call signature.
+    All Vld fields are set to 1 (Valid); only StandstillVld=1 is confirmed from the stock logs.
+    We intentionally do NOT assert JerkReq / BrkPrefillReq / HBAReq / AEB here to keep
+    hydraulic brakes out of the loop (panda also rejects any of those requests)."""
     values = {
-      "ADAS_LgtCtrl_ESP_Sts": 3 if long_active else 0,     # 3=Active, 0=Off
+      "ADAS_LgtCtrl_ESP_Sts": 0,                            # 0 in every state, as the stock ADAS sends
       "ADAS_LgtCtrl_ESP_Vld": 1,                            # 1=Valid
       "ADAS_ESP_DrvrOvrdSts": int(drvr_override),
       "ADAS_ESP_DrvrOvrdVld": 1,
