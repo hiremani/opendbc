@@ -199,6 +199,8 @@ class CarState(CarStateBase):
     # first long frame (OEM_last + 1), the same way the lateral path uses oem_1d0/oem_1c0.
     # 0x121's SecOC counter is rebuilt from its own fresh byte exactly like 0x1D0's above.
     self.oem_121_alive = 0
+    self.oem_121_vld = 0
+    self.oem_121_rsv = 0
     self.oem_117_alive = 0
     self.oem_118_alive = 0
     self.oem_121_secoc_full_ctr = 0
@@ -671,6 +673,10 @@ class CarState(CarStateBase):
     if self.CP.openpilotLongitudinalControl:
       oem_121 = cp_cam.vl["ADAS_0x121"]
       self.oem_121_alive = int(oem_121["ADAS_121_AliveCounter"])
+      # what OEM's own 0x121 says this frame: a valid request (1 = its ACC is commanding) and its reserved bits,
+      # which our 0x121 candidates copy so the panda can swap them in for OEM's frame (fisker_fwd_modify)
+      self.oem_121_vld = int(oem_121["ADAS_LgtCtrl_AccelVld"])
+      self.oem_121_rsv = int(oem_121["ADAS_121_Rsv_B1"])
       self.oem_117_alive = int(cp_cam.vl["ADAS_0x117"]["ADAS_117_AliveCounter"])
       self.oem_118_alive = int(cp_cam.vl["ADAS_0x118"]["ADAS_118_AliveCounter"])
       fresh121 = int(oem_121["ADAS_121_SSecOC_Fresh_Byte0"])

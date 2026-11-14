@@ -429,17 +429,16 @@ class TestFiskerHooks(unittest.TestCase):
     self.safety.set_timer(1_000_000 + self.LAT_RELAY_TIMEOUT_US)
     self.assertEqual(self.safety.safety_fwd_hook(2, 0x1C0), 0)
 
-  def test_accel(self):
-    self.safety.set_controls_allowed(True)
-    self.assertFalse(self._tx(0x121, self._u16_msg(self.ACCEL_INACTIVE)))  # only in the TX list with long
-    self._init(1)
-    self.safety.set_controls_allowed(True)
-    self.assertTrue(self._tx(0x121, self._u16_msg(self.ACCEL_INACTIVE)))
-    self.assertTrue(self._tx(0x121, self._u16_msg(self.ACCEL_MAX)))
-    self.assertFalse(self._tx(0x121, self._u16_msg(self.ACCEL_MAX + 1)))
-    self.safety.set_controls_allowed(False)
-    self.assertTrue(self._tx(0x121, self._u16_msg(self.ACCEL_INACTIVE)))
-    self.assertFalse(self._tx(0x121, self._u16_msg(self.ACCEL_MAX)))
+  def test_oem_long_frames_never_transmitted(self):
+    # Longitudinal is modify-and-forward (0x121 candidates, test_fisker_long_candidate.py): openpilot never sends its
+    # own 0x121 / 0x117 / 0x118, in either mode, whatever their content.
+    for long in (0, 1):
+      self._init(long)
+      self.safety.set_controls_allowed(True)
+      for addr in (0x121, 0x117, 0x118):
+        with self.subTest(long=long, addr=hex(addr)):
+          self.assertFalse(self._tx(addr, self._u16_msg(self.ACCEL_INACTIVE)))
+          self.assertFalse(self._tx(addr, bytearray(8)))
 
   def test_injected_frames_kept_off_adas_bus(self):
     for long in (0, 1):
@@ -460,57 +459,15 @@ class TestFiskerHooks(unittest.TestCase):
           for addr in (0x121, 0x117, 0x118):
             self.assertEqual(self.safety.safety_fwd_hook(2, addr), 0)
 
-  def test_oem_long_frame_blocked_while_ours_is_sent(self):
-    # One sender per message: ours while we send it, the OEM's otherwise, whatever controls_allowed says (with the
-    # old controls_allowed rule both 0x121 streams reached the VCU whenever we sent with controls not allowed).
-    for allowed in (False, True):
-      for addr in (0x121, 0x117, 0x118):
-        with self.subTest(allowed=allowed, addr=hex(addr)):
-          self._init(1)
-          self.safety.set_controls_allowed(allowed)
-          t = 1_000_000
-          self.safety.set_timer(t)
-          dat = self._u16_msg(self.ACCEL_INACTIVE) if addr == 0x121 else bytearray(8)
-          self.assertTrue(self._tx(addr, dat))
-          self.assertEqual(self.safety.safety_fwd_hook(2, addr), -1)
-          for other in {0x121, 0x117, 0x118} - {addr}:           # per message: the others still flow
-            self.assertEqual(self.safety.safety_fwd_hook(2, other), 0)
-          self.safety.set_timer(t + self.LONG_RELAY_TIMEOUT_US - 1)
-          self.assertEqual(self.safety.safety_fwd_hook(2, addr), -1)
-          self.safety.set_timer(t + self.LONG_RELAY_TIMEOUT_US)   # we stopped: the OEM's resumes
-          self.assertEqual(self.safety.safety_fwd_hook(2, addr), 0)
-
-  def test_rejected_accel_does_not_block_oem_accel(self):
+  def test_oem_long_frames_always_forwarded(self):
+    # nothing of ours ever replaces the OEM's 0x117 / 0x118, and its 0x121 is only ever modified, never blocked
     self._init(1)
     self.safety.set_controls_allowed(True)
-    self.safety.set_timer(1_000_000)
-    self.assertFalse(self._tx(0x121, self._u16_msg(self.ACCEL_MAX + 1)))
-    self.assertEqual(self.safety.safety_fwd_hook(2, 0x121), 0)
-
-  def test_long_status_frames_cannot_request_gear_epb_or_braking(self):
-    from opendbc.can import CANPacker
-    from opendbc.car import Bus
-    from opendbc.car.fisker.fiskercan import FiskerCAN
-    from opendbc.car.fisker.values import CAR, DBC
-    fc = FiskerCAN(None, CANPacker(DBC[CAR.FISKER_OCEAN][Bus.pt]))
-    # (byte, mask) of each request that must stay 0: 0x117 park gear, emergency EPB, emergency/park standstill;
-    # 0x118 HBA, ESP standstill, brake prefill, AEB activation
-    forbidden = {0x117: ((4, 0x01), (4, 0x08), (5, 0x10), (3, 0x10), (3, 0x20)),
-                 0x118: ((3, 0x01), (3, 0x04), (3, 0x20), (4, 0x10), (4, 0x20), (5, 0x01), (5, 0x08))}
-    self._init(1)
-    for allowed in (False, True):
-      self.safety.set_controls_allowed(allowed)
-      for long_active in (False, True):
-        for gas in (False, True):
-          frames = {0x117: fc.create_long_status(long_active, gas, gear_req=0, counter=3)[1],
-                    0x118: fc.create_long_esp_handshake(long_active, gas, counter=3)[1]}
-          for addr, dat in frames.items():
-            with self.subTest(addr=hex(addr), allowed=allowed, long_active=long_active, gas=gas):
-              self.assertTrue(self._tx(addr, dat))                # what openpilot sends goes out
-              for byte, mask in forbidden[addr]:
-                bad = bytearray(dat)
-                bad[byte] |= mask
-                self.assertFalse(self._tx(addr, bad), f"byte {byte} mask {mask:#x}")
+    for t in (INIT_DONE_US, INIT_DONE_US + 10 * LONG_RELAY_TIMEOUT_US):
+      self.safety.set_timer(t)
+      self._tx(0x121, self._u16_msg(self.ACCEL_MAX))   # rejected, and must not open any relay
+      for addr in (0x121, 0x117, 0x118):
+        self.assertEqual(self.safety.safety_fwd_hook(2, addr), 0)
 
   def test_long_relay_off_without_long_flag(self):
     self._init(0)
@@ -685,13 +642,15 @@ class TestFiskerStockSafety(TestFiskerSafetyBase, common.LongitudinalAccelSafety
       self.assertFalse(self._tx(self._accel_msg(0)))
 
 
-class TestFiskerLongSafety(TestFiskerSafetyBase, common.LongitudinalAccelSafetyTest):
-  """openpilot longitudinal (debug builds only)."""
+class TestFiskerLongSafety(TestFiskerSafetyBase):
+  """openpilot longitudinal (debug builds only). The accel reaches the VCU only by substitution into the OEM's own
+  0x121 (0x521 candidates, see fisker_fwd_modify); the accel limits and the gas / controls gating of that path are
+  tested here and in test_fisker_long_candidate.py."""
 
   SAFETY_PARAM = FiskerSafetyFlags.LONG_CONTROL
 
-  TX_MSGS = [[0x1D0, 0], [0x5D0, 1], [0x1C0, 0], [0x121, 0], [0x117, 0], [0x118, 0], [0x52A, 2], [0x35B, 2]]
-  RELAY_MALFUNCTION_ADDRS = {0: (0x1D0, 0x1C0, 0x121, 0x117, 0x118)}
+  TX_MSGS = [[0x1D0, 0], [0x5D0, 1], [0x1C0, 0], [0x521, 1], [0x52A, 2], [0x35B, 2]]
+  RELAY_MALFUNCTION_ADDRS = {0: (0x1D0, 0x1C0)}
   FWD_BLACKLISTED_ADDRS = {0: [0x1D0, 0x1C0, 0x121, 0x117, 0x118]}
 
   MAX_ACCEL = CarControllerParams.ACCEL_MAX
@@ -734,53 +693,33 @@ class TestFiskerLongSafety(TestFiskerSafetyBase, common.LongitudinalAccelSafetyT
     self._reset_safety_hooks()
     self.assertFalse(self.safety.get_gas_pressed_prev())
 
-  def test_accel_rejected_while_gas_pressed(self):
-    active_accels = (self.MIN_ACCEL, -1.0, 0.5, self.MAX_ACCEL)
+  def _substituted(self, accel, ctr=12):
+    """Ship a 0x121 candidate for `accel`, then forward the OEM's 0x121 for the same counter: did ours replace it?"""
+    from opendbc.safety.tests.test_fisker_long_candidate import candidate, oem_frame, send_candidate
+    send_candidate(self.safety, candidate(ctr, accel))
+    emit, pkt = oem_frame(self.safety, ctr)
+    self.assertTrue(emit)   # the OEM's 0x121 is never dropped
+    return bytes(pkt.data[i] for i in range(8)) == bytes(candidate(ctr, accel))
+
+  def test_accel_limits(self):
+    self.safety.set_controls_allowed(True)
+    for accel in np.arange(self.MIN_ACCEL - 1, self.MAX_ACCEL + 1, 0.05):
+      accel = round(float(accel), 2)
+      self.assertEqual(self._substituted(accel), self.MIN_ACCEL <= accel <= self.MAX_ACCEL, accel)
+
+  def test_accel_not_substituted_while_gas_pressed(self):
     self._rx(self._user_gas_msg(0))
     self.safety.set_controls_allowed(True)
-    for accel in active_accels:
-      self.assertTrue(self._tx(self._accel_msg(accel)))
-
+    self.assertTrue(self._substituted(0.5))
     self._rx(self._user_gas_msg(50))
-    self.assertTrue(self.safety.get_controls_allowed())
-    self.assertFalse(self.safety.get_longitudinal_allowed())
-    for accel in active_accels:
-      self.assertFalse(self._tx(self._accel_msg(accel)), accel)
-    self.assertTrue(self._tx(self._accel_msg(self.INACTIVE_ACCEL)))   # the inactive accel always passes
-    self.assertTrue(self.safety.get_controls_allowed())
-
+    self.assertTrue(self.safety.get_controls_allowed())     # gas doesn't disengage...
+    self.assertFalse(self._substituted(0.5))                 # ...but the OEM's own 0x121 goes to the VCU
     self._rx(self._user_gas_msg(0))
-    self.assertTrue(self.safety.get_longitudinal_allowed())
-    for accel in active_accels:
-      self.assertTrue(self._tx(self._accel_msg(accel)), accel)
+    self.assertTrue(self._substituted(0.5))
 
-  def test_accel_sweep_while_gas_pressed(self):
-    self._rx(self._user_gas_msg(50))
-    for controls_allowed in (False, True):
-      self.safety.set_controls_allowed(controls_allowed)
-      for accel in np.concatenate((np.arange(self.MIN_ACCEL - 1, self.MAX_ACCEL + 1, 0.05), [0, self.INACTIVE_ACCEL])):
-        accel = round(accel, 2)
-        self.assertEqual(self._tx(self._accel_msg(accel)), accel == self.INACTIVE_ACCEL, accel)
-
-  def test_long_status_frames_pass_while_gas_pressed(self):
-    # only the accel is held back: the status / handshake frames carry the override state to the car
-    self._rx(self._user_gas_msg(50))
-    self.safety.set_controls_allowed(True)
-    for addr in (0x117, 0x118):
-      self.assertTrue(self._tx(common.make_msg(0, addr, 8)))
-
-  def test_accel_rejected_on_gas_does_not_block_oem_accel(self):
-    # one sender per message: a 0x121 the gas check rejects must not also silence the OEM's
-    self.safety.set_controls_allowed(True)
-    self.assertTrue(self._tx(self._accel_msg(0.5)))
-    self.assertEqual(self.safety.safety_fwd_hook(2, ACCEL_MSG), -1)
-
-    self._rx(self._user_gas_msg(50))
-    self.safety.set_timer(INIT_DONE_US + LONG_RELAY_TIMEOUT_US)
-    self.assertFalse(self._tx(self._accel_msg(0.5)))
-    self.assertEqual(self.safety.safety_fwd_hook(2, ACCEL_MSG), 0)
-    self.assertTrue(self._tx(self._accel_msg(self.INACTIVE_ACCEL)))
-    self.assertEqual(self.safety.safety_fwd_hook(2, ACCEL_MSG), -1)
+  def test_accel_not_substituted_without_controls(self):
+    self.safety.set_controls_allowed(False)
+    self.assertFalse(self._substituted(0.5))
 
   def test_brake_still_disengages_with_gas_pressed(self):
     self._rx(self._vehicle_moving_msg(10))
@@ -790,10 +729,8 @@ class TestFiskerLongSafety(TestFiskerSafetyBase, common.LongitudinalAccelSafetyT
     self.assertTrue(self.safety.get_controls_allowed())
     self._rx(self._user_brake_msg(True))
     self.assertFalse(self.safety.get_controls_allowed())
-    self.assertFalse(self._tx(self._accel_msg(0.5)))
     self._rx(self._user_gas_msg(0))
-    self.assertFalse(self._tx(self._accel_msg(0.5)))
-    self.assertTrue(self._tx(self._accel_msg(self.INACTIVE_ACCEL)))
+    self.assertFalse(self._substituted(0.5))
 
   def test_gas_message_required(self):
     # with openpilot longitudinal the pedal message has to be there, like the other rx checks

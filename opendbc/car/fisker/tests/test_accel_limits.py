@@ -10,8 +10,8 @@ import unittest
 
 from opendbc.car import DT_CTRL, structs
 from opendbc.car.fisker.carcontroller import apply_fisker_accel_limits
-from opendbc.car.fisker.tests.test_long_frames import decode, make_long_car
-from opendbc.car.fisker.values import CANBUS, CarControllerParams as P
+from opendbc.car.fisker.tests.test_long_frames import decode, long_sends, make_long_car
+from opendbc.car.fisker.values import CarControllerParams as P
 
 UP = P.ACCEL_JERK_UP * DT_CTRL      # largest rise per frame
 DOWN = P.ACCEL_JERK_DOWN * DT_CTRL  # largest fall per frame
@@ -78,26 +78,22 @@ class TestApplyAccelLimits(unittest.TestCase):
 
 
 def tick(controller, cs, accel, long_active=True, gas=False):
-  """One carcontroller tick with openpilot asking for `accel`: the decoded 0x121, 0x117 and 0x118 sent."""
-  cs.out.cruiseState.enabled = True
-  cs.out.gasPressed = gas
-  cc = structs.CarControl(longActive=long_active)
-  cc.actuators.accel = accel
-  _, sends = controller.update(cc.as_reader(), structs.CarControlSP(), cs, 0)
-  frames = {addr: decode(addr, data) for addr, data, bus in sends if addr in (0x117, 0x118, 0x121) and bus == CANBUS.pt}
-  return frames[0x121], frames[0x117], frames[0x118]
+  """One carcontroller tick with openpilot asking for `accel`: the decoded 0x121 candidate (all carry the same
+  request), or None when none was sent."""
+  cands, _ = long_sends(controller, cs, accel=accel, long_active=long_active, gas=gas)
+  return decode(0x121, cands[0][1]) if cands else None
 
 
 class TestCarControllerAccel(unittest.TestCase):
   def test_engage_starts_from_measured_then_slews(self):
     controller, cs = make_long_car()
     cs.a_ego_wheel = 0.3
-    req, _, _ = tick(controller, cs, -2.0)
+    req = tick(controller, cs, -2.0)
     assert abs(req["ADAS_LgtCtrl_AccelReq"] - 0.3) < LSB
     assert req["ADAS_LgtCtrl_AccelVld"] == 1
     prev = 0.3
     for _ in range(20):
-      req, _, _ = tick(controller, cs, -2.0)
+      req = tick(controller, cs, -2.0)
       a = req["ADAS_LgtCtrl_AccelReq"]
       assert abs((prev - a) - DOWN) < 2 * LSB
       prev = a
@@ -108,34 +104,29 @@ class TestCarControllerAccel(unittest.TestCase):
     for _ in range(50):
       tick(controller, cs, 1.0)
     assert abs(controller.accel_last - 49 * UP) < 1e-6   # first frame measured (0.0), then 49 rises
-    req, status, _ = tick(controller, cs, 1.0, gas=True)
-    assert abs(req["ADAS_LgtCtrl_AccelReq"]) < LSB and req["ADAS_LgtCtrl_AccelVld"] == 0
-    assert status["ADAS_LgtCtrl_DrvrOvrdSts"] == 1
+    assert tick(controller, cs, 1.0, gas=True) is None   # OEM's own frame (its override handling) goes through
+    assert controller.accel_last == 0.0
     cs.a_ego_wheel = 0.6
-    req, _, _ = tick(controller, cs, -1.0)
+    req = tick(controller, cs, -1.0)
     assert abs(req["ADAS_LgtCtrl_AccelReq"] - 0.6) < LSB
 
   def test_disengage_is_inactive_at_once(self):
     controller, cs = make_long_car()
     for _ in range(10):
       tick(controller, cs, -3.0)
-    req, status, _ = tick(controller, cs, -3.0, long_active=False)
-    assert abs(req["ADAS_LgtCtrl_AccelReq"]) < LSB and req["ADAS_LgtCtrl_AccelVld"] == 0
-    assert status["ADAS_LgtCtrl_Sts"] == 0
+    assert tick(controller, cs, -3.0, long_active=False) is None
+    assert controller.accel_last == 0.0
 
   def test_standstill_hold_frames(self):
-    # openpilot's LongControl holds CarParams.stopAccel (default -2.0) once stopped. What goes out: a plain
-    # ACC decel request, no standstill / hold request bits (panda rejects those).
+    # openpilot's LongControl holds CarParams.stopAccel (default -2.0) once stopped. What goes out: a plain ACC
+    # decel request in OEM's 0x121; standstill / hold stay the OEM ADAS's (we send no 0x117 / 0x118 at all).
     controller, cs = make_long_car()
     cs.out.vEgoRaw = 0.0
     cs.out.standstill = True
     for _ in range(200):
-      req, status, esp = tick(controller, cs, -2.0)
+      req = tick(controller, cs, -2.0)
     assert abs(req["ADAS_LgtCtrl_AccelReq"] + 2.0) < LSB
     assert req["ADAS_LgtCtrl_AccelVld"] == 1
-    assert (status["ADAS_LgtCtrl_Sts"], status["ADAS_LgtCtrl_Typ"]) == (3, 1)
-    assert status["ADAS_HAP_EmgyStandstillReq"] == 0 and status["ADAS_ParkStandstillReq"] == 0
-    assert esp["ADAS_ESP_StandstillReq"] == 0 and esp["ADAS_LgtCtrl_ESP_Sts"] == 0
 
   def test_new_actuators_report_the_sent_accel(self):
     controller, cs = make_long_car()

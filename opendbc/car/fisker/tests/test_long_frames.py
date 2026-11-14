@@ -1,17 +1,16 @@
 """
-The 0x121 accel frame openpilot injects (create_accel_command) must encode accel on the stock
-ADAS module's scale, carry a valid plain-E2E checksum, and signal AccelVld only while openpilot is
-actually commanding longitudinal — an idle heartbeat (accel_active=False) sends AccelVld=Init so the
-VCU ignores the request. Scale/offset are the DBC's for ADAS_LgtCtrl_AccelReq; the golden raw values
-come from stock frames in drives 000000af--28a9f95752--1 and 000000b4--d0f733ebb2--5. The 0x117/0x118
-status values per state match what the stock ADAS sends, and the long counters (AliveCounters and
-0x121's SecOC counter) continue the OEM ADAS's own bus-2 streams at the first long frame, then free-run.
+The 0x121 accel frame (create_accel_command) must encode accel on the stock ADAS module's scale and carry a valid
+plain-E2E checksum; the golden raw values come from stock frames in drives 000000af--28a9f95752--1 and
+000000b4--d0f733ebb2--5. openpilot longitudinal is modify-and-forward: it never sends 0x121 / 0x117 / 0x118 of its
+own, only 0x121 candidates (0x521) carrying OEM's own alive / SecOC counters and reserved bits, for the panda to
+swap into the OEM's frame. On the car (verify_121, 2026-11-14) the candidates rebuilt the OEM's own 0x121 byte for
+byte, MAC included, for 11509 of 11537 frames; the rest fall at SecOC window restarts, where the OEM frame passes.
 """
 import unittest
 
 from opendbc.can import CANPacker, CANParser
 from opendbc.car import Bus, structs
-from opendbc.car.fisker.carcontroller import CarController
+from opendbc.car.fisker.carcontroller import LAT_CANDIDATE_BUS, LONG_CANDIDATE_ADDR, CarController, lat_candidates
 from opendbc.car.fisker.carstate import CarState
 from opendbc.car.fisker.fiskercan import FiskerCAN, fisker_plain_checksum
 from opendbc.car.fisker.interface import CarInterface
@@ -117,106 +116,60 @@ def make_long_car():
   cs.out = structs.CarState(vEgoRaw=10.)
   cs.secoc_trip, cs.secoc_reset = 1, 5
   cs.oem_121_reset_flag = 5 & 0x3   # OEM's 0x121 is in the GW's window
+  cs.oem_121_secoc_full_ctr, cs.oem_121_alive = 40, 7
+  cs.oem_121_vld, cs.oem_121_rsv = 1, 0   # the OEM ACC is engaged and commanding
   return controller, cs
 
 
-def long_counters(controller, cs, cruise=True, long_active=True):
-  """One carcontroller tick: {addr: AliveCounter} of the long frames sent, plus 'secoc' = 0x121's wire counter."""
+def long_sends(controller, cs, accel=0.5, cruise=True, long_active=True, gas=False):
+  """One carcontroller tick: (0x121 candidates as (addr, data, bus), every frame sent)."""
   cs.out.cruiseState.enabled = cruise
-  _, sends = controller.update(structs.CarControl(longActive=long_active).as_reader(), structs.CarControlSP(), cs, 0)
-  out = {addr: data[1] & 0xF for addr, data, bus in sends if addr in (0x121, 0x117, 0x118) and bus == CANBUS.pt}
-  for addr, data, _bus in sends:
-    if addr == 0x121:
-      out['secoc'] = (data[4] >> 2) & 0x3F
-  return out
+  cs.out.gasPressed = gas
+  cc = structs.CarControl(longActive=long_active)
+  cc.actuators.accel = accel
+  _, sends = controller.update(cc.as_reader(), structs.CarControlSP(), cs, 0)
+  return [m for m in sends if m[0] == LONG_CANDIDATE_ADDR and m[2] == LAT_CANDIDATE_BUS], sends
 
 
-def sent_0x121_freshness(controller, cs):
-  """One long-active tick: (reset, secoc counter) of the 0x121 sent. The wire byte carries the reset flag and
-  the low 6 bits of the counter; the MAC is checked against the full values, so both must be right."""
-  cs.out.cruiseState.enabled = True
-  _, sends = controller.update(structs.CarControl(longActive=True).as_reader(), structs.CarControlSP(), cs, 0)
-  data = next(d for addr, d, bus in sends if addr == 0x121 and bus == CANBUS.pt)
-  reset, ctr = controller.secoc_reset_prev, controller.secoc_window_ctr
-  assert data[4] == wire_freshness_byte(ctr, reset)
-  assert data[5:8] == secoc_mac(controller.secoc_key, 0x121, data[:4], cs.secoc_trip, reset, ctr)
-  return reset, ctr
+class TestLongCandidates(unittest.TestCase):
+  """openpilot longitudinal is modify-and-forward: never a frame of its own on 0x121 / 0x117 / 0x118, only complete
+  0x121 frames (the candidates) for the panda to swap into the OEM's own 0x121 (safety fisker_fwd_modify)."""
 
-
-class TestLongCounters(unittest.TestCase):
-  def test_continue_oem_at_first_frame_then_free_run_skipping_15(self):
+  def test_never_sends_the_oem_long_messages(self):
     controller, cs = make_long_car()
-    cs.oem_121_alive, cs.oem_117_alive, cs.oem_118_alive = 13, 14, 5
-    cs.oem_121_secoc_full_ctr = 40
-    assert long_counters(controller, cs, cruise=False, long_active=False) == {}   # not engaged yet: nothing sent
+    for kw in ({}, {"gas": True}, {"long_active": False}, {"cruise": False}):
+      _, sends = long_sends(controller, cs, **kw)
+      assert not [m for m in sends if m[0] in (0x121, 0x117, 0x118)], kw
 
-    # First long frame: OEM_last + 1 for every counter (14 + 1 wraps to 0: 15 is never sent).
-    assert long_counters(controller, cs) == {0x121: 14, 0x117: 0, 0x118: 6, 'secoc': 41}
-    # OEM's counters keep moving on bus 2 but we free-run from our own, +1 per frame.
-    cs.oem_121_alive, cs.oem_117_alive, cs.oem_118_alive = 2, 2, 2
-    cs.oem_121_secoc_full_ctr = 7
-    expected = [(0, 1, 7, 42), (1, 2, 8, 43), (2, 3, 9, 44)]
-    for a121, a117, a118, secoc in expected:
-      assert long_counters(controller, cs) == {0x121: a121, 0x117: a117, 0x118: a118, 'secoc': secoc}
-
-  def test_counters_never_reach_15(self):
+  def test_candidates_continue_oem_counters_and_verify(self):
     controller, cs = make_long_car()
-    seen = set()
-    for _ in range(40):
-      c = long_counters(controller, cs)
-      seen |= {c[0x121], c[0x117], c[0x118]}
-    assert seen == set(range(15))
+    cands, _ = long_sends(controller, cs)
+    assert cands
+    slots = []
+    for _addr, data, _bus in cands:
+      ctr = next(k for k, a, r in lat_candidates(40, 7, 5) if wire_freshness_byte(k, r) == data[4] and a == data[1] & 0xF)
+      assert data[5:8] == secoc_mac(controller.secoc_key, 0x121, data[:4], cs.secoc_trip, 5, ctr)   # a valid MAC
+      assert fisker_plain_checksum(0x121, data) == data[0]
+      slots.append(ctr)
+    assert 40 in slots and 41 in slots     # OEM's current frame and the next one are covered
+    for ctr, (_addr, data, _bus) in zip(slots, cands, strict=True):
+      assert data[1] & 0xF == (7 + ctr - 40) % 15   # alive steps with the counter, OEM's numbering
 
-  def test_reset_restarts_0x121_secoc_counter_when_oem_does(self):
-    # Frame by frame around a GW reset step. GW_Syn_All steps first; OEM's 0x121 restarts its SecOC
-    # counter 0-10 ms later (one frame here), which carstate sees as 0x121's reset flag flipping. Our
-    # 0x121 stays in the old window until then and restarts at 1 on the same frame as OEM, the same
-    # rule as the 0x1D0 candidates (oem_reset_value).
+  def test_candidate_carries_our_accel_valid_and_oem_reserved_bits(self):
     controller, cs = make_long_car()
-    cs.oem_121_secoc_full_ctr = 98
-    assert sent_0x121_freshness(controller, cs) == (5, 99)   # seed: OEM + 1, in OEM's window
-    assert sent_0x121_freshness(controller, cs) == (5, 100)
-    cs.secoc_reset = 6                                          # GW steps; OEM still in window 5
-    assert sent_0x121_freshness(controller, cs) == (5, 101)
-    cs.oem_121_reset_flag = 6 & 0x3                             # OEM restarts one frame later
-    assert sent_0x121_freshness(controller, cs) == (6, 1)
-    assert sent_0x121_freshness(controller, cs) == (6, 2)
+    cs.oem_121_rsv = 2
+    cs.a_ego_wheel = 0.5
+    cands, _ = long_sends(controller, cs, accel=0.5)
+    for _addr, data, _bus in cands:
+      d = decode(0x121, data)
+      assert abs(d["ADAS_LgtCtrl_AccelReq"] - 0.5) < 0.001 and d["ADAS_LgtCtrl_AccelVld"] == 1
+      assert d["ADAS_121_Rsv_B1"] == 2
 
-  def test_restart_on_the_gw_frame_when_oem_has_no_lag(self):
-    # A 0.0 ms lag (also seen on the car): OEM's flag flips on the same frame as GW_Syn_All.
-    controller, cs = make_long_car()
-    cs.oem_121_secoc_full_ctr = 60
-    assert sent_0x121_freshness(controller, cs) == (5, 61)
-    cs.secoc_reset, cs.oem_121_reset_flag = 6, 6 & 0x3
-    assert sent_0x121_freshness(controller, cs) == (6, 1)
-
-  def test_seed_right_after_gw_step_uses_oem_window(self):
-    # First long frame between the GW step and OEM's restart: the seed counter is OEM's (old window),
-    # so the frame is stamped with the old reset, not the GW's new one.
-    controller, cs = make_long_car()
-    cs.secoc_reset, cs.oem_121_reset_flag = 6, 5 & 0x3
-    cs.oem_121_secoc_full_ctr = 100
-    assert sent_0x121_freshness(controller, cs) == (5, 101)
-    cs.oem_121_reset_flag = 6 & 0x3
-    assert sent_0x121_freshness(controller, cs) == (6, 1)
-
-  def test_window_never_goes_back(self):
-    # A stale or glitched OEM flag must not make us stamp an older reset window again (a replay).
-    controller, cs = make_long_car()
-    cs.oem_121_secoc_full_ctr = 10
-    assert sent_0x121_freshness(controller, cs) == (5, 11)
-    cs.secoc_reset, cs.oem_121_reset_flag = 6, 6 & 0x3
-    assert sent_0x121_freshness(controller, cs) == (6, 1)
-    cs.oem_121_reset_flag = 5 & 0x3
-    assert sent_0x121_freshness(controller, cs) == (6, 2)
-
-  def test_resnap_after_tx_stops(self):
-    # Long TX stops only while it was never long-active (the heartbeat stays on after that); the
-    # next start continues OEM again.
-    controller, cs = make_long_car()
-    cs.oem_121_alive, cs.oem_117_alive, cs.oem_118_alive = 3, 4, 5
-    assert long_counters(controller, cs, long_active=False) == {0x121: 4, 0x117: 5, 0x118: 6, 'secoc': 1}
-    assert long_counters(controller, cs, cruise=False, long_active=False) == {}
-    cs.oem_121_alive, cs.oem_117_alive, cs.oem_118_alive = 9, 10, 11
-    cs.oem_121_secoc_full_ctr = 20
-    assert long_counters(controller, cs) == {0x121: 10, 0x117: 11, 0x118: 12, 'secoc': 21}
+  def test_no_candidates_unless_oem_acc_commanding_and_driver_off_gas(self):
+    for setup, kw in ((lambda cs: setattr(cs, "oem_121_vld", 0), {}),   # OEM ACC not commanding
+                      (lambda cs: None, {"gas": True}),                    # driver on the gas
+                      (lambda cs: None, {"long_active": False})):          # openpilot not commanding
+      controller, cs = make_long_car()
+      setup(cs)
+      cands, _ = long_sends(controller, cs, **kw)
+      assert not cands, kw

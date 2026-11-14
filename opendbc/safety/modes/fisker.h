@@ -185,6 +185,60 @@ static bool fisker_cand_armed(void) {
   return safety_get_ts_elapsed(microsecond_timer_get(), fisker_cand_last_rx) < FISKER_CAND_ARM_US;
 }
 
+// ---- 0x121 candidate substitution (openpilot longitudinal: modify-and-forward) -----------------
+// Building our own 0x121 / 0x117 / 0x118 and blocking the OEM's (the earlier design) made the VCU drop VCU_ACCRdy
+// ~50 ms after our frames started (route 000000ea, 2026-11-14, all 9 engages): our from-scratch frames differed from
+// the OEM ADAS's in fields we don't model. So openpilot no longer sends any of them. The OEM ADAS's own ACC keeps
+// running and its 0x117 / 0x118 always reach the car untouched; only the accel request in its 0x121 is ours, and
+// only while openpilot longitudinal is allowed. The 0x121 MAC is computed in userspace, so the same candidate pool as
+// 0x1D0 is used: openpilot ships fully-stamped 0x121 payloads for the counters around OEM's (0x521 on bus 1, buffered
+// here and never transmitted) and fisker_fwd_modify swaps in the one matching OEM's frame on its way to the VCU.
+// Unlike 0x1D0, a frame with no usable candidate is forwarded as the OEM sent it, never dropped: the worst case is
+// stock ACC for that frame. Substituted only when the OEM frame itself carries a valid request (AccelVld = 1, i.e.
+// the OEM ACC is engaged), its reserved bits match the candidate's, and longitudinal is allowed right now
+// (controls allowed, gas not pressed).
+#define FISKER_LONG_CANDIDATE_ADDR 0x521U
+
+static FiskerCandidate fisker_long_cand[64][FISKER_CAND_SLOTS];
+static uint32_t fisker_long_cand_last_rx = 0U;
+
+static FiskerCandidate *fisker_long_cand_slot(uint8_t byte4, uint8_t alive) {
+  FiskerCandidate *slots = fisker_long_cand[(byte4 >> 2) & 0x3FU];
+  FiskerCandidate *pick = NULL;
+  for (uint32_t i = 0U; i < FISKER_CAND_SLOTS; i++) {
+    if (slots[i].used && (slots[i].byte4 == byte4) && (slots[i].alive == alive)) {
+      pick = &slots[i];
+      break;
+    }
+  }
+  if (pick == NULL) {
+    for (uint32_t i = 0U; i < FISKER_CAND_SLOTS; i++) {
+      if (!fisker_cand_fresh(&slots[i])) {
+        pick = &slots[i];
+        break;
+      }
+    }
+  }
+  if (pick == NULL) {
+    pick = &slots[0];
+    for (uint32_t i = 1U; i < FISKER_CAND_SLOTS; i++) {
+      if (safety_get_ts_elapsed(microsecond_timer_get(), slots[i].rx_ts) > safety_get_ts_elapsed(microsecond_timer_get(), pick->rx_ts)) {
+        pick = &slots[i];
+      }
+    }
+  }
+  return pick;
+}
+
+static bool fisker_long_cand_armed(void) {
+  return safety_get_ts_elapsed(microsecond_timer_get(), fisker_long_cand_last_rx) < FISKER_CAND_ARM_US;
+}
+
+// 0x121 byte 1: AliveCounter 11|4 -> bits 3..0, ADAS_LgtCtrl_AccelVld 13|2 -> bits 5..4, ADAS_121_Rsv_B1 15|2 -> bits 7..6
+static uint8_t fisker_121_vld(const uint8_t data1) {
+  return (data1 >> 4) & 0x03U;
+}
+
 // Steering: raw CAN at 0.0625 deg/LSB, offset -780 deg. Raw 12480 == 0 deg.
 #define FISKER_ANGLE_ZERO_CAN 12480
 #define FISKER_MAX_ANGLE_CAN 9600   // 600 deg * 16 CAN/deg
@@ -649,6 +703,25 @@ static bool fisker_tx_hook(const CANPacket_t *msg) {
     tx = false;  // panda-internal: never transmit onto the radar link
   }
 
+  // 0x121 candidate pool (0x521 on bus 1, openpilot longitudinal only: only then in the TX list). Same handling as the
+  // 0x1D0 pool: check the accel with the same limits as a direct 0x121 (outside them, or with longitudinal not
+  // allowed, the candidate is kept as not usable), require a valid request (AccelVld = 1), buffer, never transmit.
+  if ((msg->addr == FISKER_LONG_CANDIDATE_ADDR) && (msg->bus == 1U)) {
+    int raw_accel = (msg->data[2] << 8) | msg->data[3];
+    bool accel_ok = !longitudinal_accel_checks(raw_accel, FISKER_LONG_LIMITS) && (fisker_121_vld(msg->data[1]) == 1U);
+    FiskerCandidate *c = fisker_long_cand_slot(msg->data[4], msg->data[1] & 0x0FU);
+    for (int i = 0; i < 8; i++) {
+      c->data[i] = msg->data[i];
+    }
+    c->byte4 = msg->data[4];
+    c->alive = msg->data[1] & 0x0FU;
+    c->rx_ts = microsecond_timer_get();
+    c->angle_ok = accel_ok;
+    c->used = true;
+    fisker_long_cand_last_rx = c->rx_ts;
+    tx = false;  // panda-internal: never transmit onto the radar link
+  }
+
   // ICC settings spoof (0x52A, bus 2): record the TX timestamp so the fwd_hook knows
   // whether the ICC's own 0x52A should still be blocked bus 0 -> bus 2.
   if ((msg->addr == 0x52AU) && (msg->bus == 2U)) {
@@ -709,6 +782,21 @@ static bool fisker_fwd_modify(CANPacket_t *to_send) {
   if ((to_send->addr == 0x514U) && (to_send->bus == 0U)) {
     fisker_fixup_mfs(to_send);
   }
+  if (fisker_longitudinal && (to_send->addr == 0x121U) && (to_send->bus == 2U) && fisker_long_cand_armed() &&
+      (fisker_121_vld(to_send->data[1]) == 1U) && get_longitudinal_allowed()) {
+    const FiskerCandidate *slots = fisker_long_cand[(to_send->data[4] >> 2) & 0x3FU];
+    for (uint32_t i = 0U; i < FISKER_CAND_SLOTS; i++) {
+      const FiskerCandidate *c = &slots[i];
+      if (fisker_cand_fresh(c) && c->angle_ok && (c->byte4 == to_send->data[4]) &&
+          (c->alive == (to_send->data[1] & 0x0FU)) && ((c->data[1] & 0xC0U) == (to_send->data[1] & 0xC0U))) {
+        for (int j = 0; j < 8; j++) {
+          to_send->data[j] = c->data[j];
+        }
+        break;
+      }
+    }
+    // no usable candidate: the OEM's own frame goes through unchanged (stock ACC for this frame)
+  }
   if ((to_send->addr == 0x1D0U) && (to_send->bus == 2U) && fisker_cand_armed()) {
     const FiskerCandidate *slots = fisker_cand[(to_send->data[4] >> 2) & 0x3FU];
     const FiskerCandidate *c = NULL;
@@ -754,9 +842,7 @@ static safety_config fisker_init(uint16_t param) {
     {0x1D0, 0, 8, .check_relay = true, .disable_static_blocking = true},    // steering angle (fwd path; see fisker_fwd_modify)
     {0x5D0, 1, 8, .check_relay = false},                                    // 0x1D0 candidate pool (buffered, then rejected: never sent on bus 1)
     {0x1C0, 0, 8, .check_relay = true, .disable_static_blocking = true},    // lateral activation
-    {0x121, 0, 8, .check_relay = true, .disable_static_blocking = true},    // accel (op long only)
-    {0x117, 0, 8, .check_relay = true, .disable_static_blocking = true},    // long control status
-    {0x118, 0, 8, .check_relay = true, .disable_static_blocking = true},    // long/ESP handshake
+    {0x521, 1, 8, .check_relay = false},                                    // 0x121 candidate pool (buffered, then rejected; see fisker_fwd_modify)
     {0x52A, 2, 8, .check_relay = false},                                    // ICC settings spoof (bus 2)
     {0x35B, 2, 8, .check_relay = false},                                    // ICC SVS/BSD/APA settings (bus 2)
   };

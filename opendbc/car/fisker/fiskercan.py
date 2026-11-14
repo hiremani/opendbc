@@ -171,7 +171,7 @@ class FiskerCAN:
     chk = fisker_plain_checksum(addr, data)
     return addr, bytes([chk]) + data[1:], bus
 
-  def create_accel_command(self, accel: float, accel_active: bool, counter: int):
+  def create_accel_command(self, accel: float, accel_active: bool, counter: int, rsv: int = 0):
     """ADAS_0x121 — longitudinal accel request, 10 ms cycle. SecOC-protected.
     `accel_active` gates the wire-level Vld — 1(Valid) while we're actually commanding,
     0(Initializing) otherwise so the VCU ignores the request while we're disengaged/idle.
@@ -180,6 +180,7 @@ class FiskerCAN:
     values = {
       "ADAS_LgtCtrl_AccelReq": accel,
       "ADAS_LgtCtrl_AccelVld": 1 if accel_active else 0,
+      "ADAS_121_Rsv_B1": rsv & 0x3,   # copied from OEM's frame: the panda only swaps in a candidate whose bits match
       "ADAS_121_AliveCounter": counter & 0xF,
       "ADAS_121_CheckSum": 0,   # filled in below
     }

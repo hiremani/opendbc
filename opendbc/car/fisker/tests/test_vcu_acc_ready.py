@@ -7,7 +7,7 @@ import unittest
 
 from opendbc.can import CANPacker, CANParser
 from opendbc.car import Bus, structs
-from opendbc.car.fisker.carcontroller import ACCEL_CAN_ID, CarController
+from opendbc.car.fisker.carcontroller import ACCEL_CAN_ID, LAT_CANDIDATE_BUS, LONG_CANDIDATE_ADDR, CarController
 from opendbc.car.fisker.carstate import VCU_ACC_RDY_LOST_FRAMES, CarState
 from opendbc.car.fisker.interface import CarInterface
 from opendbc.car.fisker.values import CANBUS, CAR, DBC
@@ -41,21 +41,25 @@ def feed(CS, parsers, packer, steps):
 
 
 def long_frames(CP, CP_SP, CS, long_active=True, accel=0.5):
-  """What the carcontroller packs on 0x117 / 0x121 for this carstate: (Sts, Typ, AccelVld, AccelReq)."""
+  """What the carcontroller commands for this carstate: (AccelVld, AccelReq) of its 0x121 candidates, (0, 0.0) if
+  it sends none (then the OEM's own 0x121 reaches the VCU untouched)."""
   controller = CarController(DBC[CAR.FISKER_OCEAN], CP, CP_SP)
   controller.secoc_key_verified = True
   controller.secoc_key = bytes(16)  # synthetic key, no vehicle credentials
   CS.out = structs.CarState(vEgoRaw=10.)
   CS.out.cruiseState.enabled = True
+  CS.oem_121_vld = 1   # the OEM ACC is commanding
   cc = structs.CarControl(longActive=long_active)
   cc.actuators.accel = accel
   CS.a_ego_wheel = accel  # a fresh controller's first request is the measured accel (jerk limiter); make it the request
   _, sends = controller.update(cc.as_reader(), structs.CarControlSP(), CS, 0)
-  parser = CANParser(DBC_NAME, [("ADAS_0x117", float('nan')), ("ADAS_0x121", float('nan'))], CANBUS.pt)
-  parser.update([(0, [msg for msg in sends if msg[0] in (0x117, ACCEL_CAN_ID)])])
-  status, cmd = parser.vl["ADAS_0x117"], parser.vl["ADAS_0x121"]
-  return (int(status["ADAS_LgtCtrl_Sts"]), int(status["ADAS_LgtCtrl_Typ"]),
-          int(cmd["ADAS_LgtCtrl_AccelVld"]), round(cmd["ADAS_LgtCtrl_AccelReq"], 2))
+  cands = [m for m in sends if m[0] == LONG_CANDIDATE_ADDR and m[2] == LAT_CANDIDATE_BUS]
+  if not cands:
+    return 0, 0.0
+  parser = CANParser(DBC_NAME, [("ADAS_0x121", float('nan'))], CANBUS.pt)
+  parser.update([(0, [(ACCEL_CAN_ID, cands[0][1], CANBUS.pt)])])
+  cmd = parser.vl["ADAS_0x121"]
+  return int(cmd["ADAS_LgtCtrl_AccelVld"]), round(cmd["ADAS_LgtCtrl_AccelReq"], 2)
 
 
 class TestVcuAccReady(unittest.TestCase):
@@ -104,13 +108,13 @@ class TestVcuAccReady(unittest.TestCase):
   def test_carcontroller_stops_commanding_accel(self):
     CP, CP_SP, CS, parsers, packer = make_carstate(op_long=True)
     feed(CS, parsers, packer, [(ACTIVE, 1)] * 3)
-    assert long_frames(CP, CP_SP, CS) == (3, 1, 1, 0.5)   # Active, ACC (the stock Typ), Valid, the request
+    assert long_frames(CP, CP_SP, CS) == (1, 0.5)   # Valid, the request
     feed(CS, parsers, packer, [(ACTIVE, 0)] * VCU_ACC_RDY_LOST_FRAMES)
     assert CS.vcu_acc_rdy_lost
-    assert long_frames(CP, CP_SP, CS) == (0, 0, 0, 0.0)   # the idle heartbeat: Off, Not_Active, no request
-    assert long_frames(CP, CP_SP, CS, long_active=False) == (0, 0, 0, 0.0)
+    assert long_frames(CP, CP_SP, CS) == (0, 0.0)   # no candidates: the OEM's own 0x121
+    assert long_frames(CP, CP_SP, CS, long_active=False) == (0, 0.0)
     feed(CS, parsers, packer, [(ACTIVE, 1)])
-    assert long_frames(CP, CP_SP, CS) == (3, 1, 1, 0.5)
+    assert long_frames(CP, CP_SP, CS) == (1, 0.5)
 
 
 if __name__ == "__main__":
