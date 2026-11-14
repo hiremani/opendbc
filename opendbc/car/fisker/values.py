@@ -279,3 +279,8 @@ SETTLE_MAX_TICKS = 150    # ~1.5 s
 # OVERRIDE_DEG, release once the wheel is back within RELEASE_DEG of the command.
 ANGLE_OVERRIDE_DEG = 30.0          # deg
 ANGLE_OVERRIDE_RELEASE_DEG = 10.0  # deg
+# Cooperative signaled turn (carcontroller.coop_signaled_turn): below this speed, with the blinker on toward the
+# side the wheel is turned, a command wanting at least as much turn as the wheel has is not an override. Matches
+# the map turn planner's release speed (turn_planner.V_ABORT).
+TURN_COOP_MAX_SPEED = 9.0          # m/s (~20 mph)
+TURN_COOP_UNWIND_DEG = 0.05        # deg/tick (5 deg/s): the wheel coming back faster than this is the driver unwinding

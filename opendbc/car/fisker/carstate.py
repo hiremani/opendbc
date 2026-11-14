@@ -239,6 +239,7 @@ class CarState(CarStateBase):
     # steeringPressed is sensitive (light touch) for auto-lane-change / UI; this is
     # conservative (real overpower) for the EPS release in carcontroller. See update().
     self.driver_intervening = False
+    self.torque_latch_only = False
     # Torque-override hysteresis: latch set when driver torque exceeds OVERRIDE_STEER_TORQUE,
     # cleared only after it falls below OVERRIDE_RELEASE_TORQUE for OVERRIDE_RELEASE_FRAMES —
     # stops the ~10 Hz grab/release chatter when the driver holds right at the trip point.
@@ -389,6 +390,9 @@ class CarState(CarStateBase):
       self.driver_intervening = drvr_intv or torque_override
     else:
       self.driver_intervening = abs(ret.steeringTorque) > STEER_THRESHOLD
+    # Only our own torque latch is holding the yield (not the EPS's overpower bit, not the invalid-bit fallback):
+    # the one case carcontroller may set aside, in a cooperative signaled turn (carcontroller.coop_signaled_turn).
+    self.torque_latch_only = drvr_intv_vld and not drvr_intv and torque_override
 
     # EPS lateral control state (EPS_AdasLatCtrlSts on 0x1C2):
     #   0=Off, 1=Available_For_Control, 2=Active, 3=Failure

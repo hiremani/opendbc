@@ -1,3 +1,4 @@
+import math
 import numpy as np
 
 from opendbc.can import CANPacker
@@ -8,7 +9,8 @@ from opendbc.car.lateral import apply_std_steer_angle_limits
 
 from opendbc.car.fisker.fiskercan import FiskerCAN
 from opendbc.car.fisker.secoc import stamp_secoc, sync_mac
-from opendbc.car.fisker.values import (ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_RELEASE_DEG,
+from opendbc.car.fisker.values import (ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_RELEASE_DEG, OVERRIDE_STEER_TORQUE,
+                                        TURN_COOP_MAX_SPEED, TURN_COOP_UNWIND_DEG,
                                         CarControllerParams, ICC_0x35B_OVERRIDES,
                                         SETTLE_ANGLE_STEP, SETTLE_MAX_TICKS, STANDSTILL_PAUSE_SPEED)
 from opendbc.sunnypilot.car.fisker.values_ext import FiskerFlagsSP
@@ -132,6 +134,20 @@ def apply_fisker_accel_limits(target, last, measured, active, was_active):
   return float(np.clip(step, P.ACCEL_MIN, P.ACCEL_MAX))
 
 
+def coop_signaled_turn(desired_angle, wheel_angle, wheel_step, v_ego, left_blinker, right_blinker):
+  """True when taking the wheel would only continue the driver's own signaled low-speed turn: the blinker is on
+  toward the side the wheel is turned, the driver is turning into it or holding (not unwinding: wheel_step, the
+  wheel's change since the last tick, is not moving it back toward center faster than TURN_COOP_UNWIND_DEG per
+  tick), and the command is on that side too and wants at least as much turn (within ANGLE_OVERRIDE_RELEASE_DEG)
+  as the wheel has. A driver straightening out of the turn is never "cooperating". Angles in deg, positive = left."""
+  if v_ego >= TURN_COOP_MAX_SPEED or desired_angle * wheel_angle <= 0.0:
+    return False
+  if wheel_step * math.copysign(1.0, wheel_angle) < -TURN_COOP_UNWIND_DEG:
+    return False
+  toward = (left_blinker and not right_blinker and wheel_angle > 0.0) or (right_blinker and not left_blinker and wheel_angle < 0.0)
+  return toward and abs(desired_angle) >= abs(wheel_angle) - ANGLE_OVERRIDE_RELEASE_DEG
+
+
 def apply_fisker_steer_angle_limits(desired_angle, last_angle, speed, measured_angle, lat_active, controls_permitted):
   # Req=0 releases the EPS, but Panda still rate-checks 0x1D0 while ACC/MADS permits
   # control. Follow the driver's measured angle at the normal rate instead of
@@ -215,6 +231,7 @@ class CarController(CarControllerBase):
     self._settle_hold = 0               # ticks left to wait for the wheel to stop self-centering
     self._prev_steer_angle = 0.0        # for the settle angle-rate check
     self._angle_override_latch = False  # measured wheel diverged far from command -> driver steering
+    self._coop_release = False          # the latch was just released by a cooperative signaled turn
 
     # ICC 0x52A spoof: emit ONE frame per OEM tick (detected by AliveCounter change).
     # ICC broadcasts at ~10 Hz while we control at 100 Hz, so a naive tx-every-tick
@@ -505,11 +522,30 @@ class CarController(CarControllerBase):
     # on the target: while latched apply_angle_last is glued to the wheel, so it can't tell when the driver is done.
     angle_diverge = abs(CS.out.steeringAngleDeg - desired_angle_deg)
     command_diverge = abs(CS.out.steeringAngleDeg - self.apply_angle_last)
-    if angle_diverge > ANGLE_OVERRIDE_DEG and command_diverge > ANGLE_OVERRIDE_DEG:
+    # Cooperative signaled turn: the driver started a signaled low-speed turn ahead of us and the command now wants
+    # at least as much turn, the same way, as the wheel has. Taking over then just carries on the driver's turn, so
+    # it is not an override (on-vehicle 2026-11-14: the driver started every signaled turn 0.2-1.8 s before the
+    # turn planner, the latch tripped, and since the planner's target never came back within RELEASE_DEG of a wheel
+    # held through the turn, it handed every turn back for good). Pushing against us still trips the torque override.
+    coop_turn = coop_signaled_turn(desired_angle_deg, CS.out.steeringAngleDeg,
+                                   CS.out.steeringAngleDeg - self._prev_steer_angle, CS.out.vEgoRaw,
+                                   CS.out.leftBlinker, CS.out.rightBlinker)
+    if angle_diverge > ANGLE_OVERRIDE_DEG and command_diverge > ANGLE_OVERRIDE_DEG and not coop_turn:
       self._angle_override_latch = True
-    elif angle_diverge < ANGLE_OVERRIDE_RELEASE_DEG:
+    elif angle_diverge < ANGLE_OVERRIDE_RELEASE_DEG or coop_turn:
+      self._coop_release = self._coop_release or (self._angle_override_latch and coop_turn)
       self._angle_override_latch = False
-    lat_active = (CC.latActive and secoc_ok and not CS.driver_intervening
+    # The same cooperative turn sets our torque latch aside (never the EPS's own overpower bit): a driver who pushed
+    # the wheel into the turn trips it, and holding a turned wheel against its self-centering takes 1.6-2.6 Nm, so
+    # it never falls below OVERRIDE_RELEASE_TORQUE until the turn is over (on-vehicle 2026-11-14, every signaled turn).
+    # Only while the driver's torque is below the trip level and holds into the turn: pulling back toward center,
+    # however lightly, is an override.
+    driver_intervening = CS.driver_intervening
+    if (driver_intervening and coop_turn and getattr(CS, "torque_latch_only", False)
+        and abs(CS.out.steeringTorque) < OVERRIDE_STEER_TORQUE and CS.out.steeringTorque * CS.out.steeringAngleDeg >= 0.0):
+      driver_intervening = False
+      self._coop_release = True
+    lat_active = (CC.latActive and secoc_ok and not driver_intervening
                   and not standstill_pause and not self._angle_override_latch)
 
     # Smooth re-entry after any pause (driver override release, or crossing the standstill
@@ -521,7 +557,11 @@ class CarController(CarControllerBase):
     resume_edge = lat_active and not self.was_lat_active_prev and self.was_lat_engaged_prev
     if resume_edge:
       self.engage_delay_remaining = self.ENGAGE_DELAY_TICKS
-      self._settle_hold = SETTLE_MAX_TICKS
+      # Mid-turn the driver is still turning the wheel, so waiting for it to settle would hold off up to 1.5 s,
+      # most of the turn. We pick up from the wheel and slew the same way it is already going.
+      self._settle_hold = 0 if self._coop_release else SETTLE_MAX_TICKS
+    if lat_active or not CC.latActive:
+      self._coop_release = False
     # Settle wait: a fixed hold still grabbed a wheel that was still self-centering fast on
     # release, which fought the wheel — a jerk, a transient EPS abort ("steering temporarily
     # unavailable"), and the rate limiter saturating (a false "limit" alert). On-vehicle
@@ -715,7 +755,7 @@ class CarController(CarControllerBase):
         _addr, stamped, _bus = self._stamp(steer_msg, STEER_CAN_ID, trip, reset_k, secoc_k)
         can_sends.append((LAT_CANDIDATE_ADDR, stamped, LAT_CANDIDATE_BUS))
       can_sends.append(self.fcan.create_lat_control(lat_active_wire, self.alive_1c0,
-                                                    driver_override=CS.driver_intervening,
+                                                    driver_override=driver_intervening,
                                                     lat_ctrl_typ=lat_ctrl_typ,
                                                     lat_engaged=lat_engaged_wire))
 

@@ -208,6 +208,87 @@ class TestSteeringHandover(unittest.TestCase):
     controller.update(cc.as_reader(), cc_sp, cs, 0)
     assert controller._angle_override_latch
 
+  def _turn_controller(self):
+    cp, sp, cs = _make_car()
+    controller = CarController(DBC[CAR.FISKER_OCEAN], cp, sp)
+    controller.secoc_key_verified = True
+    controller.secoc_key = bytes(16)
+    cc_sp = structs.CarControlSP()
+    cc_sp.mads.active = True
+    controller.was_lat_engaged_prev = True
+    controller.was_lat_active_prev = True
+    controller.was_tx_lateral_prev = True
+    controller.engage_delay_remaining = 0
+    cs.eps_lat_sts = 2
+    return controller, cc_sp, cs
+
+  def test_driver_leading_a_signaled_turn_is_taken_over(self):
+    # On-vehicle 2026-11-14: the driver starts each signaled turn before the turn planner, the latch trips, and the
+    # planner's target (-263 deg) never comes within RELEASE_DEG of the held wheel (-140..-180): every turn handed
+    # back. Once the command wants at least as much turn the same way, taking over just carries the turn on.
+    controller, cc_sp, cs = self._turn_controller()
+    cc = structs.CarControl(latActive=True)
+    controller.apply_angle_last = 20.0
+    controller._prev_steer_angle = -50.0
+    cs.out = structs.CarState(steeringAngleDeg=-52.0, vEgoRaw=1.5, rightBlinker=True)
+    cc.actuators.steeringAngleDeg = 20.0           # planner not turning yet: the command still points the other way
+    controller.update(cc.as_reader(), cc_sp, cs, 0)
+    assert controller._angle_override_latch        # driver ahead -> yield, as before
+
+    for wheel in (-90.0, -138.0, -140.0):          # the driver keeps turning; the planner starts and overtakes
+      cs.out.steeringAngleDeg = wheel
+      cc.actuators.steeringAngleDeg = -263.0
+      controller.update(cc.as_reader(), cc_sp, cs, 0)
+    assert not controller._angle_override_latch    # -> taken over mid-turn
+    assert controller._settle_hold == 0            # without waiting for the (turning) wheel to settle
+    assert controller.engage_delay_remaining > 0   # still the normal re-grab hold from the live wheel
+
+  def test_unwinding_or_unsignaled_or_fast_is_still_an_override(self):
+    cases = [
+      dict(wheel=-140.0, prev=-150.0, v=1.5, right=True, cmd=-263.0),    # driver straightening out of the turn
+      dict(wheel=-140.0, prev=-139.0, v=1.5, right=False, cmd=-263.0),   # no blinker
+      dict(wheel=-140.0, prev=-139.0, v=12.0, right=True, cmd=-263.0),   # above TURN_COOP_MAX_SPEED
+      dict(wheel=-140.0, prev=-139.0, v=1.5, right=True, cmd=-60.0),     # command wants less turn than the wheel
+    ]
+    for c in cases:
+      controller, cc_sp, cs = self._turn_controller()
+      cc = structs.CarControl(latActive=True)
+      controller.apply_angle_last = 0.0
+      controller._prev_steer_angle = c["prev"]
+      cs.out = structs.CarState(steeringAngleDeg=c["wheel"], vEgoRaw=c["v"], rightBlinker=c["right"])
+      cc.actuators.steeringAngleDeg = c["cmd"]
+      controller.update(cc.as_reader(), cc_sp, cs, 0)
+      assert controller._angle_override_latch, c
+
+  def test_torque_latch_held_by_a_turn_grip_is_set_aside(self):
+    # On-vehicle 2026-11-14 (ee seg 17, t 25.7): the driver pushed 4 Nm into a right turn the car had not started,
+    # the torque latch tripped, and holding the turned wheel (1.6-2.6 Nm) kept it above the 0.5 Nm release for the
+    # whole turn. In a cooperative signaled turn that latch alone no longer holds the yield.
+    for torque, eps_bit, expect_steer in ((-1.8, False, True),    # holding into the turn: steer
+                                          (+1.0, False, False),   # pulling back toward center: yield
+                                          (-3.5, False, False),   # pushing past the trip level: yield
+                                          (-1.8, True, False)):   # the EPS's own overpower bit: always yield
+      controller, cc_sp, cs = self._turn_controller()
+      cc = structs.CarControl(latActive=True)
+      controller._prev_steer_angle = -139.0
+      controller.apply_angle_last = -140.0
+      cs.out = structs.CarState(steeringAngleDeg=-140.0, vEgoRaw=2.0, rightBlinker=True, steeringTorque=torque)
+      cs.driver_intervening = True
+      cs.torque_latch_only = not eps_bit
+      cc.actuators.steeringAngleDeg = -263.0
+      for _ in range(controller.ENGAGE_DELAY_TICKS + 2):   # through the normal re-grab hold
+        controller.update(cc.as_reader(), cc_sp, cs, 0)
+      # lat_active (the Req bit); a torque pause keeps the candidate stream running with Req=0
+      assert controller.was_lat_active_prev == expect_steer, (torque, eps_bit)
+
+  def test_coop_signaled_turn_predicate(self):
+    from opendbc.car.fisker.carcontroller import coop_signaled_turn
+    assert coop_signaled_turn(-263.0, -140.0, -1.0, 2.0, False, True)        # right turn, turning in
+    assert coop_signaled_turn(200.0, 120.0, 0.0, 2.0, True, False)           # left turn, holding
+    assert not coop_signaled_turn(200.0, 120.0, 0.0, 2.0, False, True)       # blinker the other way
+    assert not coop_signaled_turn(-263.0, 140.0, 0.0, 2.0, True, False)      # command the other way
+    assert not coop_signaled_turn(-263.0, -140.0, 0.0, 2.0, True, True)      # hazards: no side
+
   def test_torque_override_yields_below_eps_threshold(self):
     car = _make_car()
     # The EPS's own intervention bit only trips at ~6.5 Nm. We yield proactively at
