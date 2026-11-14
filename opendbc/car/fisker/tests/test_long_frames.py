@@ -15,6 +15,7 @@ from opendbc.car.fisker.carcontroller import CarController
 from opendbc.car.fisker.carstate import CarState
 from opendbc.car.fisker.fiskercan import FiskerCAN, fisker_plain_checksum
 from opendbc.car.fisker.interface import CarInterface
+from opendbc.car.fisker.secoc import secoc_mac, wire_freshness_byte
 from opendbc.car.fisker.values import CANBUS, CAR, DBC
 from opendbc.testing import parameterized
 
@@ -115,6 +116,7 @@ def make_long_car():
   controller.secoc_key = bytes(16)  # synthetic key, no vehicle credentials
   cs.out = structs.CarState(vEgoRaw=10.)
   cs.secoc_trip, cs.secoc_reset = 1, 5
+  cs.oem_121_reset_flag = 5 & 0x3   # OEM's 0x121 is in the GW's window
   return controller, cs
 
 
@@ -127,6 +129,18 @@ def long_counters(controller, cs, cruise=True, long_active=True):
     if addr == 0x121:
       out['secoc'] = (data[4] >> 2) & 0x3F
   return out
+
+
+def sent_0x121_freshness(controller, cs):
+  """One long-active tick: (reset, secoc counter) of the 0x121 sent. The wire byte carries the reset flag and
+  the low 6 bits of the counter; the MAC is checked against the full values, so both must be right."""
+  cs.out.cruiseState.enabled = True
+  _, sends = controller.update(structs.CarControl(longActive=True).as_reader(), structs.CarControlSP(), cs, 0)
+  data = next(d for addr, d, bus in sends if addr == 0x121 and bus == CANBUS.pt)
+  reset, ctr = controller.secoc_reset_prev, controller.secoc_window_ctr
+  assert data[4] == wire_freshness_byte(ctr, reset)
+  assert data[5:8] == secoc_mac(controller.secoc_key, 0x121, data[:4], cs.secoc_trip, reset, ctr)
+  return reset, ctr
 
 
 class TestLongCounters(unittest.TestCase):
@@ -153,13 +167,48 @@ class TestLongCounters(unittest.TestCase):
       seen |= {c[0x121], c[0x117], c[0x118]}
     assert seen == set(range(15))
 
-  def test_gw_reset_restarts_0x121_secoc_counter(self):
+  def test_reset_restarts_0x121_secoc_counter_when_oem_does(self):
+    # Frame by frame around a GW reset step. GW_Syn_All steps first; OEM's 0x121 restarts its SecOC
+    # counter 0-10 ms later (one frame here), which carstate sees as 0x121's reset flag flipping. Our
+    # 0x121 stays in the old window until then and restarts at 1 on the same frame as OEM, the same
+    # rule as the 0x1D0 candidates (oem_reset_value).
     controller, cs = make_long_car()
     cs.oem_121_secoc_full_ctr = 98
-    assert long_counters(controller, cs)['secoc'] == 99 & 0x3F   # only the low 6 bits are on the wire
-    cs.secoc_reset = 6
-    assert long_counters(controller, cs)['secoc'] == 1
-    assert long_counters(controller, cs)['secoc'] == 2
+    assert sent_0x121_freshness(controller, cs) == (5, 99)   # seed: OEM + 1, in OEM's window
+    assert sent_0x121_freshness(controller, cs) == (5, 100)
+    cs.secoc_reset = 6                                          # GW steps; OEM still in window 5
+    assert sent_0x121_freshness(controller, cs) == (5, 101)
+    cs.oem_121_reset_flag = 6 & 0x3                             # OEM restarts one frame later
+    assert sent_0x121_freshness(controller, cs) == (6, 1)
+    assert sent_0x121_freshness(controller, cs) == (6, 2)
+
+  def test_restart_on_the_gw_frame_when_oem_has_no_lag(self):
+    # A 0.0 ms lag (also seen on the car): OEM's flag flips on the same frame as GW_Syn_All.
+    controller, cs = make_long_car()
+    cs.oem_121_secoc_full_ctr = 60
+    assert sent_0x121_freshness(controller, cs) == (5, 61)
+    cs.secoc_reset, cs.oem_121_reset_flag = 6, 6 & 0x3
+    assert sent_0x121_freshness(controller, cs) == (6, 1)
+
+  def test_seed_right_after_gw_step_uses_oem_window(self):
+    # First long frame between the GW step and OEM's restart: the seed counter is OEM's (old window),
+    # so the frame is stamped with the old reset, not the GW's new one.
+    controller, cs = make_long_car()
+    cs.secoc_reset, cs.oem_121_reset_flag = 6, 5 & 0x3
+    cs.oem_121_secoc_full_ctr = 100
+    assert sent_0x121_freshness(controller, cs) == (5, 101)
+    cs.oem_121_reset_flag = 6 & 0x3
+    assert sent_0x121_freshness(controller, cs) == (6, 1)
+
+  def test_window_never_goes_back(self):
+    # A stale or glitched OEM flag must not make us stamp an older reset window again (a replay).
+    controller, cs = make_long_car()
+    cs.oem_121_secoc_full_ctr = 10
+    assert sent_0x121_freshness(controller, cs) == (5, 11)
+    cs.secoc_reset, cs.oem_121_reset_flag = 6, 6 & 0x3
+    assert sent_0x121_freshness(controller, cs) == (6, 1)
+    cs.oem_121_reset_flag = 5 & 0x3
+    assert sent_0x121_freshness(controller, cs) == (6, 2)
 
   def test_resnap_after_tx_stops(self):
     # Long TX stops only while it was never long-active (the heartbeat stays on after that); the

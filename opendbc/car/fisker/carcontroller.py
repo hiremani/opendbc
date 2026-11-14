@@ -1,7 +1,7 @@
 import numpy as np
 
 from opendbc.can import CANPacker
-from opendbc.car import Bus, structs
+from opendbc.car import DT_CTRL, Bus, structs
 from opendbc.car.carlog import carlog
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.lateral import apply_std_steer_angle_limits
@@ -115,6 +115,23 @@ def lat_candidates(oem_full, oem_alive, oem_reset):
   return cands
 
 
+def apply_fisker_accel_limits(target, last, measured, active, was_active):
+  """The 0x121 accel request for this frame.
+
+  Not active (not long-active, or the driver is on the gas): the inactive value 0.0, at once.
+  First active frame: the measured acceleration, so the request does not jump at engage.
+  After that: move toward the target by at most ACCEL_JERK_UP / ACCEL_JERK_DOWN per frame.
+  The result is always within ACCEL_MIN..ACCEL_MAX."""
+  P = CarControllerParams
+  if not active:
+    return 0.0
+  if not was_active:
+    return float(np.clip(measured, P.ACCEL_MIN, P.ACCEL_MAX))
+  target = float(np.clip(target, P.ACCEL_MIN, P.ACCEL_MAX))
+  step = float(np.clip(target, last - P.ACCEL_JERK_DOWN * DT_CTRL, last + P.ACCEL_JERK_UP * DT_CTRL))
+  return float(np.clip(step, P.ACCEL_MIN, P.ACCEL_MAX))
+
+
 def apply_fisker_steer_angle_limits(desired_angle, last_angle, speed, measured_angle, lat_active, controls_permitted):
   # Req=0 releases the EPS, but Panda still rate-checks 0x1D0 while ACC/MADS permits
   # control. Follow the driver's measured angle at the normal rate instead of
@@ -153,7 +170,12 @@ class CarController(CarControllerBase):
     # straight from OEM's counter (lat_candidates), so this counter is only 0x121's: it is
     # seeded from OEM's own 0x121 stream on the first long frame (see the long section).
     self.secoc_window_ctr = 0
-    self.secoc_reset_prev = None    # GW reset change while transmitting -> re-seed to the new window
+    self.secoc_reset_prev = None    # reset window of our last 0x121; a newer one restarts the counter
+
+    # 0x121 accel request after the jerk limiter (apply_fisker_accel_limits), and whether the last
+    # frame was actively commanding (the limiter restarts from the measured accel when it was not).
+    self.accel_last = 0.0
+    self.was_accel_active_prev = False
 
     # Longitudinal E2E AliveCounters (0x121 / 0x117 / 0x118, openpilot longitudinal only). Same
     # "we ARE OEM" continuation as the lateral alive_1d0 / alive_1c0 below: on the first long
@@ -267,14 +289,23 @@ class CarController(CarControllerBase):
     stamped = stamp_secoc(self.secoc_key, can_id, data, trip, reset, msg_counter)
     return addr, stamped, bus
 
-  def _advance_long_counters(self, CS, reset) -> None:
+  def _advance_long_counters(self, CS, reset) -> int:
     """Counters for this tick's long frames (0x121 / 0x117 / 0x118), called only on ticks that send them.
+    Returns the GW reset value to stamp this tick's 0x121 with.
 
     First long frame after not transmitting (the "block moment"): continue OEM's own bus-2
     streams — each AliveCounter is OEM_last + 1 (mod 15, so 15 is never sent) and 0x121's
     SecOC counter is OEM 0x121's reconstructed full counter + 1. After that, free-run +1 per
     frame, so at the end of TX OEM resumes at our_last + 1. Same policy as the lateral
-    alive_1d0 / alive_1c0 seeding."""
+    alive_1d0 / alive_1c0 seeding.
+
+    Reset window: the same lagged rule as the 0x1D0 candidates (oem_reset_value). OEM restarts
+    its 0x121 SecOC counter 0-10 ms (up to one frame) AFTER GW_Syn_All steps, the same as 0x1D0
+    (recorded drives: 473 resets in 8 min of 000000e5, lags 0.0-10.4 ms). So the window is OEM
+    0x121's own (its reset flag, as carstate last saw it), not the GW's: the counter restarts at 1
+    on the frame where OEM's window steps, and stays in the old window until then. The window never
+    goes back while we transmit (a stale flag cannot make us stamp an older reset again)."""
+    long_reset = oem_reset_value(reset, int(CS.oem_121_reset_flag))
     # 0x121 SecOC counter policy (history from 0x1D0, which uses the same per-window index):
     # We become OEM's exact continuation. On the first TX after an idle gap (the
     # "block moment", i.e. when the panda relay starts stealing OEM's frames), snap
@@ -293,28 +324,32 @@ class CarController(CarControllerBase):
     # reset — it restarts. The EPS only sees OUR 0x1D0 (OEM's is blocked), so it
     # follows our stream: when our reset field increments it expects the counter to
     # restart. We restart to 1 (the documented "first frame after reset" value), in
-    # lockstep with our own reset_bits (both driven by CS.secoc_reset), so the
+    # lockstep with our own reset_bits (both driven by long_reset), so the
     # freshness we sign and the freshness the EPS reconstructs stay consistent.
     #
     # Do NOT re-snap to carstate's oem_full at the reset: OEM's 0x1D0 restarts ~10 ms
     # AFTER the GW_Syn_All reset (CMP showed oursResetBits flip a tick before OEM's),
     # so at the GW_Syn_All edge carstate's OEM wire is still the stale pre-restart
     # value — re-snapping to it yanked our counter ~25 backward -> EPS replay abort.
+    # The restart itself follows OEM's lagged window (long_reset, see the docstring).
     if not self.was_tx_long_prev:
       self.alive_121 = (int(CS.oem_121_alive) + 1) % 15
       self.alive_117 = (int(CS.oem_117_alive) + 1) % 15
       self.alive_118 = (int(CS.oem_118_alive) + 1) % 15
+      # The seed counter is from OEM's window, so it is stamped with OEM's window too.
       self.secoc_window_ctr = int(CS.oem_121_secoc_full_ctr) + 1
+      self.secoc_reset_prev = long_reset
     else:
       self.alive_121 = (self.alive_121 + 1) % 15
       self.alive_117 = (self.alive_117 + 1) % 15
       self.alive_118 = (self.alive_118 + 1) % 15
-      if reset != self.secoc_reset_prev:
-        # GW reset: per-window counter restarts at 1.
+      if long_reset > self.secoc_reset_prev:
+        # OEM's 0x121 moved to the next reset window: per-window counter restarts at 1.
         self.secoc_window_ctr = 1
+        self.secoc_reset_prev = long_reset
       else:
         self.secoc_window_ctr += 1
-    self.secoc_reset_prev = reset
+    return self.secoc_reset_prev
 
   def _remote_steer_override(self, planner_angle_deg: float, v_ego: float, now_nanos: int) -> float:
     """If the phone remote-control app is armed AND fresh AND we're below the low-speed
@@ -713,7 +748,7 @@ class CarController(CarControllerBase):
     # modulates on state (what fiskercan.create_long_status / create_long_esp_handshake /
     # create_accel_command actually pack; ADAS_LgtCtrl_Typ: 0=Not_Active 1=ACC 2=ACC_Stop_and_Go):
     #   long_active + not gas_override: 0x117 Sts=Active(3), Typ=ACC(1); 0x118 ESP_Sts=0;
-    #                                   AccelVld=1, AccelReq = openpilot's commanded accel
+    #                                   AccelVld=1, AccelReq = openpilot's accel, jerk-limited
     #   long_active + gas_override:     0x117 Sts=Active(3), Typ=ACC(1), DrvrOvrdSts=1;
     #                                   0x118 ESP_Sts=0; AccelVld=0, AccelReq=0 (yield to the
     #                                   driver's pedal)
@@ -733,9 +768,13 @@ class CarController(CarControllerBase):
       long_active = CC.longActive and secoc_ok and not CS.vcu_acc_rdy_lost
       gas_override = CS.out.gasPressed         # driver commanding accel via pedal
       accel_active = long_active and not gas_override
-      accel = 0.0 if not accel_active else float(np.clip(actuators.accel,
-                                                          self.params.ACCEL_MIN,
-                                                          self.params.ACCEL_MAX))
+      # Jerk-limited request (apply_fisker_accel_limits): 0.0 at once when not commanding; on the first
+      # commanding frame the speed-derived measured accel, so there is no step at engage or after a gas
+      # override; then at most ACCEL_JERK_UP / ACCEL_JERK_DOWN per frame toward openpilot's accel.
+      accel = apply_fisker_accel_limits(actuators.accel, self.accel_last, CS.a_ego_wheel,
+                                        accel_active, self.was_accel_active_prev)
+      self.accel_last = accel
+      self.was_accel_active_prev = accel_active
       if long_active:
         self.long_ever_active = True
 
@@ -750,11 +789,11 @@ class CarController(CarControllerBase):
 
       tx_long = engaged or self.long_ever_active
       if tx_long:
-        self._advance_long_counters(CS, reset)
+        long_reset = self._advance_long_counters(CS, reset)
 
-        # 0x121 accel command (SecOC)
+        # 0x121 accel command (SecOC), stamped in OEM 0x121's reset window (see _advance_long_counters)
         accel_msg = self.fcan.create_accel_command(accel, accel_active, self.alive_121)
-        can_sends.append(self._stamp(accel_msg, ACCEL_CAN_ID, trip, reset, self.secoc_window_ctr))
+        can_sends.append(self._stamp(accel_msg, ACCEL_CAN_ID, trip, long_reset, self.secoc_window_ctr))
 
         # 0x117 status + 0x118 ESP handshake (plain E2E, no SecOC)
         can_sends.append(self.fcan.create_long_status(long_active, gas_override,
@@ -812,6 +851,8 @@ class CarController(CarControllerBase):
 
     new_actuators = actuators.as_builder()
     new_actuators.steeringAngleDeg = self.apply_angle_last
+    if self.CP.openpilotLongitudinalControl:
+      new_actuators.accel = self.accel_last
 
     self.frame += 1
     return new_actuators, can_sends

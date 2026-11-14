@@ -205,6 +205,8 @@ class CarState(CarStateBase):
     self._oem_121_wraps = 0
     self._oem_121_wire_last = 0
     self._oem_121_rflag_last = None
+    self.oem_121_reset_flag = 0       # 0x121's own reset flag: which GW reset window OEM's 0x121 is in
+    self.a_ego_wheel = 0.0            # speed-derived acceleration, see update()
 
     # ICC_0x52A cached values. This is the ICC settings frame we spoof on bus 2 when
     # cruise is engaged: we forward every OEM signal untouched EXCEPT ICCACCFuncTyp
@@ -304,6 +306,10 @@ class CarState(CarStateBase):
 
     ret.vEgoRaw = cp_pt.vl["ESP_0x318"]["ESP_VehSpd"] * CV.KPH_TO_MS
     ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
+    # The speed-derived acceleration, kept before aEgo is replaced by the accelerometer below. It has no
+    # road-grade offset (the accelerometer reads g*sin(grade) even at rest), so the carcontroller starts
+    # its 0x121 accel request from this value when openpilot longitudinal starts to command.
+    self.a_ego_wheel = float(ret.aEgo)
     # ICC_DispVehSpd is the number on the cluster, in the driver-selected unit
     # (ICC_DispVehSpdUnit VAL_: 0=KMH, 1=MPH). It MUST be converted with the matching
     # factor — on a US car (mph cluster) treating it as km/h reads ~1.609x low
@@ -672,6 +678,7 @@ class CarState(CarStateBase):
         self._oem_121_wraps += 1
       self._oem_121_wire_last = wire121
       self._oem_121_rflag_last = rflag121
+      self.oem_121_reset_flag = rflag121
       self.oem_121_secoc_full_ctr = self._oem_121_wraps * 64 + wire121
 
     # ---- EPS lateral status (0x1C2) — snapshot for the spoof --------------

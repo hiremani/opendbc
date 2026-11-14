@@ -49,6 +49,7 @@ def long_frames(CP, CP_SP, CS, long_active=True, accel=0.5):
   CS.out.cruiseState.enabled = True
   cc = structs.CarControl(longActive=long_active)
   cc.actuators.accel = accel
+  CS.a_ego_wheel = accel  # a fresh controller's first request is the measured accel (jerk limiter); make it the request
   _, sends = controller.update(cc.as_reader(), structs.CarControlSP(), CS, 0)
   parser = CANParser(DBC_NAME, [("ADAS_0x117", float('nan')), ("ADAS_0x121", float('nan'))], CANBUS.pt)
   parser.update([(0, [msg for msg in sends if msg[0] in (0x117, ACCEL_CAN_ID)])])

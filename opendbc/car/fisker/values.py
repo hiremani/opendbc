@@ -110,6 +110,16 @@ class CarControllerParams:
   ACCEL_MAX = 1.0                         # m/s²
   ACCEL_MIN = -3.5                        # m/s²
 
+  # Jerk (slew) limits on the 0x121 accel request, per direction, in m/s^3 (the carcontroller applies
+  # them per 10 ms frame). From the stock ADAS's own 0x121 requests while stock ACC was Active (OEM
+  # bus-2 frames in the 6 recorded routes under routes/, 4.9 min Active incl. the braking in 000000dd and 000000e8):
+  # the stock ADAS updates its request in steps every ~30 ms, so it was measured over 100 ms windows,
+  # skipping 0.5 s after activation and 0.2 s before deactivation. Rising: p99 1.50, p99.9 14.5.
+  # Falling: p99 2.80, p99.9 15.0. Both limits are set below the stock p99. Rising is also kept at
+  # 1.0 or lower to stay well away from the actual-above-request fault in 000000c6 (see ACCEL_MAX).
+  ACCEL_JERK_UP = 1.0                     # m/s^3, accel request increasing (incl. releasing the brake)
+  ACCEL_JERK_DOWN = 2.5                   # m/s^3, accel request decreasing (incl. braking harder)
+
   # 0x121 ADAS_LgtCtrl_AccelReq scale: 0.0004882 m/s²/LSB, offset -16
   ACCEL_SCALE = 0.0004882
   ACCEL_OFFSET = -16.0
