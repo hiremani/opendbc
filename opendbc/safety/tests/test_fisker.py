@@ -1,13 +1,28 @@
 #!/usr/bin/env python3
+import importlib
 import unittest
+from unittest import mock
 
+import numpy as np
+
+from opendbc.car.fisker.values import CarControllerParams, FiskerSafetyFlags
 from opendbc.car.structs import CarParams
 import opendbc.safety.tests.common as common
+from opendbc.safety.tests.common import CANPackerSafety
 from opendbc.safety.tests.libsafety import libsafety_py
 
 ICC_SETTINGS = 0x52A
 ICC_FRAME = bytes.fromhex("BE2026A043008220")
 TIMEOUT_US = 500_000
+
+GAS_MSG = 0x214      # VCU_0x214, 16 bytes
+ACCEL_MSG = 0x121
+LONG_MSGS = (0x121, 0x117, 0x118)
+LONG_RELAY_TIMEOUT_US = 60_000
+INIT_DONE_US = 1_000_000   # past the relay windows that are open right after a safety mode init
+
+# the messages every Fisker configuration needs to see: (addr, bus)
+COMMON_RX_MSGS = ((0x115, 0), (0x318, 0), (0x1C2, 0), (0x1C4, 0), (0x313, 2), (0x514, 0))
 
 
 class TestFiskerIccSettings(unittest.TestCase):
@@ -503,6 +518,345 @@ class TestFiskerHooks(unittest.TestCase):
     for addr in (0x121, 0x117, 0x118):
       self.assertFalse(self._tx(addr, bytearray(8)))           # not in the TX list
       self.assertEqual(self.safety.safety_fwd_hook(2, addr), 0)
+
+
+class TestFiskerSafetyBase(common.CarSafetyTest, common.AngleSteeringSafetyTest):
+  SAFETY_PARAM = 0
+
+  TX_MSGS = [[0x1D0, 0], [0x5D0, 1], [0x1C0, 0], [0x52A, 2], [0x35B, 2]]
+  RELAY_MALFUNCTION_ADDRS = {0: (0x1D0, 0x1C0)}
+  # Forwarding is time-relay based, not static. This is the picture while openpilot sends nothing, which is what
+  # the standard test_fwd_hook sees: only the frames openpilot injects on bus 0 are kept off the ADAS's bus. The
+  # relays themselves (what gets blocked while openpilot sends) are tested in test_fisker.py.
+  FWD_BLACKLISTED_ADDRS = {0: [0x1D0, 0x1C0]}
+
+  STANDSTILL_THRESHOLD = 0
+  GAS_PRESSED_THRESHOLD = 1   # percent pedal, as carstate: pressed above 1 %
+
+  # Angle command limits
+  STEER_ANGLE_MAX = CarControllerParams.ANGLE_LIMITS.STEER_ANGLE_MAX
+  STEER_ANGLE_TEST_MAX = 700  # the signal's range is +-780 deg
+  DEG_TO_CAN = 16
+  ANGLE_RATE_BP = CarControllerParams.ANGLE_LIMITS.ANGLE_RATE_LIMIT_UP[0]
+  ANGLE_RATE_UP = CarControllerParams.ANGLE_LIMITS.ANGLE_RATE_LIMIT_UP[1]
+  ANGLE_RATE_DOWN = CarControllerParams.ANGLE_LIMITS.ANGLE_RATE_LIMIT_DOWN[1]
+
+  def setUp(self):
+    self.packer = CANPackerSafety("fisker_ocean_adas")
+    self.safety = libsafety_py.libsafety
+    self.safety.set_timer(0)  # init_tests() also resets the timer to 0; keep init's timestamp consistent
+    self.safety.set_current_safety_param_sp(0)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.fisker, self.SAFETY_PARAM)
+    self.safety.init_tests()
+    self.safety.set_timer(INIT_DONE_US)
+    self.speed = 0.
+    self.brake = False
+
+  def _angle_cmd_msg(self, angle: float, enabled: bool, increment_timer: bool = True):
+    # 0x1D0 has no enable bit: steering counts as requested whenever the frame is sent
+    values = {"ADAS_LatCtrl_SteerAnReq": angle}
+    return self.packer.make_can_msg_safety("ADAS_0x1D0", 0, values)
+
+  def _angle_meas_msg(self, angle: float):
+    values = {"EPS_SteerWhlAgSig": angle}
+    return self.packer.make_can_msg_safety("EPS_0x1C2", 0, values)
+
+  def _esp_msg(self):
+    # ESP_0x318 carries both the vehicle speed and the brake pedal, so each helper keeps the other's last value
+    values = {"ESP_VehSpd": self.speed * 3.6, "ESP_BrkPedlSts": 1 if self.brake else 0}
+    return self.packer.make_can_msg_safety("ESP_0x318", 0, values)
+
+  def _speed_msg(self, speed):
+    self.speed = speed
+    return self._esp_msg()
+
+  def _speed_msg_2(self, speed):
+    return None
+
+  def _vehicle_moving_msg(self, speed: float):
+    # NOTE: built from the bytes fisker_rx_hook reads (byte 1 low 6 bits + byte 2), like test_fisker.py's
+    # test_vehicle_moving. The DBC puts ESP_WhlSpd_RF (21|14@0+) one byte later, in bytes 2-3; a frame packed
+    # from the DBC does not drive vehicle_moving the way these tests need.
+    whl = round(speed * 3.6 / 0.0625)
+    dat = bytearray(8)
+    dat[1], dat[2] = whl >> 8, whl & 0xFF
+    return common.make_msg(0, 0x115, dat=bytes(dat))
+
+  def _user_brake_msg(self, brake):
+    self.brake = bool(brake)
+    return self._esp_msg()
+
+  def _user_gas_msg(self, gas):
+    values = {"VCU_APSPerc": gas}
+    return self.packer.make_can_msg_safety("VCU_0x214", 0, values)
+
+  def _pcm_status_msg(self, enable):
+    values = {"ADAS_Sts_ACC_ICC": 3 if enable else 2}  # Active / Standby
+    return self.packer.make_can_msg_safety("ADAS_0x313", 2, values)
+
+  def _lkas_button_msg(self, enabled):
+    values = {"MFS_RiBtnSouth": 2 if enabled else 0}   # the long press is the MADS button
+    return self.packer.make_can_msg_safety("MFS_0x514", 0, values)
+
+  def _rx_common_msgs(self):
+    for addr, bus in COMMON_RX_MSGS:
+      self.assertTrue(self._rx(common.make_msg(bus, addr, 8)))
+
+  def test_tx_hook_on_wrong_safety_mode(self):
+    # The two Fisker configurations share their TX messages, like the other brands' variants common.py exempts.
+    # (Patched on the module common.py imports, which is not this one when the test runner loads it by path.)
+    module = importlib.import_module("opendbc.safety.tests.test_fisker")
+    for name in ("TestFiskerStockSafety", "TestFiskerLongSafety"):
+      self.assertTrue(issubclass(getattr(module, name), common.SafetyTest))
+    other = "TestFiskerLongSafety" if type(self).__name__ == "TestFiskerStockSafety" else "TestFiskerStockSafety"
+    with mock.patch.object(getattr(module, other), "TX_MSGS", None):
+      super().test_tx_hook_on_wrong_safety_mode()
+
+  def test_angle_cmd_when_disabled(self):
+    # 0x1D0 has no enable bit, so unlike the standard test there is no "not requested" frame while controls are
+    # allowed. With controls allowed the command is held to the rate limits (test_angle_cmd_when_enabled); with
+    # controls not allowed only the measured angle may be sent.
+    for controls_allowed in (True, False):
+      self.safety.set_controls_allowed(controls_allowed)
+      for angle_meas in np.arange(-90, 91, 10):
+        self._reset_angle_measurement(angle_meas)
+        for angle_cmd in np.arange(-90, 91, 10):
+          self._set_prev_desired_angle(angle_cmd)
+          should_tx = controls_allowed or angle_cmd == angle_meas
+          self.assertEqual(should_tx, self._tx(self._angle_cmd_msg(angle_cmd, controls_allowed)))
+
+  def test_gas_does_not_change_controls_allowed(self):
+    for controls_allowed in (False, True):
+      for lateral in (False, True):
+        with self.subTest(controls_allowed=controls_allowed, lateral=lateral):
+          self._rx(self._user_gas_msg(0))
+          self.safety.set_controls_allowed(controls_allowed)
+          self.safety.set_controls_allowed_lateral(lateral)
+          for gas in (50, 50, 0, 0):
+            self._rx(self._user_gas_msg(gas))
+            self.assertEqual(self.safety.get_controls_allowed(), controls_allowed)
+            self.assertEqual(self.safety.get_controls_allowed_lateral(), lateral)
+
+  def test_steering_allowed_with_gas_pressed(self):
+    self._rx(self._user_gas_msg(50))
+    self._rx(self._user_gas_msg(50))
+    self._reset_angle_measurement(0)
+    self.safety.set_controls_allowed(True)
+    self._set_prev_desired_angle(0)
+    self.assertTrue(self._tx(self._angle_cmd_msg(1, True)))
+    self.assertTrue(self._tx(self.packer.make_can_msg_safety("ADAS_0x1C0", 0, {"ADAS_LatCtrl_Req": 1})))
+
+
+class TestFiskerStockSafety(TestFiskerSafetyBase, common.LongitudinalAccelSafetyTest):
+  """Steering only: what runs on the car."""
+
+  LONGITUDINAL = False
+  MAX_ACCEL = CarControllerParams.ACCEL_MAX
+  MIN_ACCEL = CarControllerParams.ACCEL_MIN
+
+  def _accel_msg(self, accel: float):
+    values = {"ADAS_LgtCtrl_AccelReq": accel}
+    return self.packer.make_can_msg_safety("ADAS_0x121", 0, values)
+
+  # The accelerator pedal is only read with openpilot longitudinal. Without it VCU_0x214 is not an rx check, so
+  # the pedal never reaches the rx hook and the message is not a liveness requirement either.
+  def test_prev_gas(self):
+    for gas in (self.GAS_PRESSED_THRESHOLD + 1, 100, 0):
+      self._rx(self._user_gas_msg(gas))
+      self.assertFalse(self.safety.get_gas_pressed_prev())
+
+  def test_no_disengage_on_gas(self):
+    self._rx(self._user_gas_msg(0))
+    self.safety.set_controls_allowed(True)
+    self._rx(self._user_gas_msg(self.GAS_PRESSED_THRESHOLD + 1))
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_longitudinal_allowed())
+
+  def test_gas_message_not_required(self):
+    self._rx_common_msgs()
+    self.safety.safety_tick_current_safety_config()
+    self.assertTrue(self.safety.safety_config_valid())
+
+  def test_long_frames_not_sent(self):
+    for controls_allowed in (False, True):
+      self.safety.set_controls_allowed(controls_allowed)
+      for addr in LONG_MSGS:
+        self.assertFalse(self._tx(common.make_msg(0, addr, 8)))
+      self.assertFalse(self._tx(self._accel_msg(0)))
+
+
+class TestFiskerLongSafety(TestFiskerSafetyBase, common.LongitudinalAccelSafetyTest):
+  """openpilot longitudinal (debug builds only)."""
+
+  SAFETY_PARAM = FiskerSafetyFlags.LONG_CONTROL
+
+  TX_MSGS = [[0x1D0, 0], [0x5D0, 1], [0x1C0, 0], [0x121, 0], [0x117, 0], [0x118, 0], [0x52A, 2], [0x35B, 2]]
+  RELAY_MALFUNCTION_ADDRS = {0: (0x1D0, 0x1C0, 0x121, 0x117, 0x118)}
+  FWD_BLACKLISTED_ADDRS = {0: [0x1D0, 0x1C0, 0x121, 0x117, 0x118]}
+
+  MAX_ACCEL = CarControllerParams.ACCEL_MAX
+  MIN_ACCEL = CarControllerParams.ACCEL_MIN
+
+  def _accel_msg(self, accel: float):
+    values = {"ADAS_LgtCtrl_AccelReq": accel}
+    return self.packer.make_can_msg_safety("ADAS_0x121", 0, values)
+
+  def _gas_raw_msg(self, raw, bus=0, length=16):
+    dat = bytearray(length)
+    dat[6] = raw  # VCU_APSPerc, 0.4 %/LSB
+    return common.make_msg(bus, GAS_MSG, dat=bytes(dat))
+
+  def test_gas_threshold(self):
+    # carstate: gasPressed = VCU_APSPerc > 1.0 %, which is raw 3 and up
+    for raw in (0, 1, 2, 3, 4, 125, 250, 255):
+      with self.subTest(raw=raw):
+        self.assertTrue(self._rx(self._gas_raw_msg(raw)))
+        self.assertEqual(self.safety.get_gas_pressed_prev(), raw > 2)
+
+  def test_gas_other_bytes_ignored(self):
+    dat = bytearray(b"\xff" * 16)
+    dat[6] = 0
+    self._rx(common.make_msg(0, GAS_MSG, dat=bytes(dat)))
+    self.assertFalse(self.safety.get_gas_pressed_prev())
+    self._rx(self._gas_raw_msg(3))
+    self.assertTrue(self.safety.get_gas_pressed_prev())
+
+  def test_gas_only_from_vehicle_bus_and_full_length(self):
+    for bus, length in ((1, 16), (2, 16), (0, 8)):
+      with self.subTest(bus=bus, length=length):
+        self._rx(self._gas_raw_msg(250, bus=bus, length=length))
+        self.assertFalse(self.safety.get_gas_pressed_prev())
+        self.assertTrue(self.safety.get_longitudinal_allowed() or not self.safety.get_controls_allowed())
+
+  def test_gas_reset_on_safety_init(self):
+    self._rx(self._user_gas_msg(50))
+    self.assertTrue(self.safety.get_gas_pressed_prev())
+    self._reset_safety_hooks()
+    self.assertFalse(self.safety.get_gas_pressed_prev())
+
+  def test_accel_rejected_while_gas_pressed(self):
+    active_accels = (self.MIN_ACCEL, -1.0, 0.5, self.MAX_ACCEL)
+    self._rx(self._user_gas_msg(0))
+    self.safety.set_controls_allowed(True)
+    for accel in active_accels:
+      self.assertTrue(self._tx(self._accel_msg(accel)))
+
+    self._rx(self._user_gas_msg(50))
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertFalse(self.safety.get_longitudinal_allowed())
+    for accel in active_accels:
+      self.assertFalse(self._tx(self._accel_msg(accel)), accel)
+    self.assertTrue(self._tx(self._accel_msg(self.INACTIVE_ACCEL)))   # the inactive accel always passes
+    self.assertTrue(self.safety.get_controls_allowed())
+
+    self._rx(self._user_gas_msg(0))
+    self.assertTrue(self.safety.get_longitudinal_allowed())
+    for accel in active_accels:
+      self.assertTrue(self._tx(self._accel_msg(accel)), accel)
+
+  def test_accel_sweep_while_gas_pressed(self):
+    self._rx(self._user_gas_msg(50))
+    for controls_allowed in (False, True):
+      self.safety.set_controls_allowed(controls_allowed)
+      for accel in np.concatenate((np.arange(self.MIN_ACCEL - 1, self.MAX_ACCEL + 1, 0.05), [0, self.INACTIVE_ACCEL])):
+        accel = round(accel, 2)
+        self.assertEqual(self._tx(self._accel_msg(accel)), accel == self.INACTIVE_ACCEL, accel)
+
+  def test_long_status_frames_pass_while_gas_pressed(self):
+    # only the accel is held back: the status / handshake frames carry the override state to the car
+    self._rx(self._user_gas_msg(50))
+    self.safety.set_controls_allowed(True)
+    for addr in (0x117, 0x118):
+      self.assertTrue(self._tx(common.make_msg(0, addr, 8)))
+
+  def test_accel_rejected_on_gas_does_not_block_oem_accel(self):
+    # one sender per message: a 0x121 the gas check rejects must not also silence the OEM's
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._tx(self._accel_msg(0.5)))
+    self.assertEqual(self.safety.safety_fwd_hook(2, ACCEL_MSG), -1)
+
+    self._rx(self._user_gas_msg(50))
+    self.safety.set_timer(INIT_DONE_US + LONG_RELAY_TIMEOUT_US)
+    self.assertFalse(self._tx(self._accel_msg(0.5)))
+    self.assertEqual(self.safety.safety_fwd_hook(2, ACCEL_MSG), 0)
+    self.assertTrue(self._tx(self._accel_msg(self.INACTIVE_ACCEL)))
+    self.assertEqual(self.safety.safety_fwd_hook(2, ACCEL_MSG), -1)
+
+  def test_brake_still_disengages_with_gas_pressed(self):
+    self._rx(self._vehicle_moving_msg(10))
+    self._rx(self._user_brake_msg(False))
+    self.safety.set_controls_allowed(True)
+    self._rx(self._user_gas_msg(50))
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._rx(self._user_brake_msg(True))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertFalse(self._tx(self._accel_msg(0.5)))
+    self._rx(self._user_gas_msg(0))
+    self.assertFalse(self._tx(self._accel_msg(0.5)))
+    self.assertTrue(self._tx(self._accel_msg(self.INACTIVE_ACCEL)))
+
+  def test_gas_message_required(self):
+    # with openpilot longitudinal the pedal message has to be there, like the other rx checks
+    self._rx_common_msgs()
+    self.safety.safety_tick_current_safety_config()
+    self.assertFalse(self.safety.safety_config_valid())
+    self.assertTrue(self._rx(self._gas_raw_msg(0)))
+    self.safety.safety_tick_current_safety_config()
+    self.assertTrue(self.safety.safety_config_valid())
+
+    # and it has to keep coming
+    self.safety.set_controls_allowed(True)
+    self.safety.set_timer(INIT_DONE_US + 2_000_000)
+    self._rx_common_msgs()
+    self.safety.safety_tick_current_safety_config()
+    self.assertFalse(self.safety.safety_config_valid())
+    self.assertFalse(self.safety.get_controls_allowed())
+
+
+class TestFiskerVcuBasicCruiseGas(unittest.TestCase):
+  """The pedal is read the same way on cars that engage from the VCU's basic cruise (FiskerBasicCruise)."""
+
+  FISKER_PARAM_SP_VCU_BASIC_CRUISE = 1
+
+  def setUp(self):
+    self.safety = libsafety_py.libsafety
+
+  def tearDown(self):
+    self.safety.set_current_safety_param_sp(0)   # libsafety is shared: leave the other tests the default
+
+  def _init(self, param):
+    self.safety.set_current_safety_param_sp(self.FISKER_PARAM_SP_VCU_BASIC_CRUISE)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.fisker, param)
+    self.safety.init_tests()
+
+  def _gas(self, raw):
+    dat = bytearray(16)
+    dat[6] = raw
+    return self.safety.safety_rx_hook(common.make_msg(0, GAS_MSG, dat=bytes(dat)))
+
+  def _vcu_cruise(self, state):
+    dat = bytearray(8)
+    dat[4] = state
+    self.safety.safety_rx_hook(common.make_msg(0, 0x358, dat=bytes(dat)))
+
+  def test_gas_with_long(self):
+    self._init(FiskerSafetyFlags.LONG_CONTROL)
+    self._vcu_cruise(3)
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertTrue(self._gas(250))
+    self.assertTrue(self.safety.get_gas_pressed_prev())
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertFalse(self.safety.get_longitudinal_allowed())
+    self.assertTrue(self._gas(0))
+    self.assertTrue(self.safety.get_longitudinal_allowed())
+
+  def test_gas_ignored_without_long(self):
+    self._init(0)
+    self._vcu_cruise(3)
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._gas(250)
+    self.assertFalse(self.safety.get_gas_pressed_prev())
+    self.assertTrue(self.safety.get_longitudinal_allowed())
 
 
 if __name__ == "__main__":

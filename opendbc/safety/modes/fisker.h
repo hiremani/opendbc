@@ -16,6 +16,7 @@
 //   TX  0x52A  ICC settings spoof         bus 2 (to ADAS); plain E2E — see below
 //   RX  0x115  wheel speeds -> vehicle_moving
 //   RX  0x318  vehicle speed + brake pedal
+//   RX  0x214  accelerator pedal -> gas_pressed (openpilot longitudinal only)
 //   RX  0x1C2  EPS steering angle
 //   RX  0x1C4  EPS driver torque
 //   RX  0x313  ADAS ACC state (cruise engaged) — cam-side (bus 2)
@@ -479,6 +480,14 @@ static void fisker_rx_hook(const CANPacket_t *msg) {
       vehicle_moving = whl_rf > 0;
     }
 
+    // VCU_0x214: accelerator pedal opening (VCU_APSPerc, 8-bit @ start 55 -> byte 6, 0.4 %/LSB). Pressed is more
+    // than 1 %, the same signal and threshold as carstate's gasPressed. The common code then refuses any 0x121 other
+    // than the inactive accel while the pedal is down (get_longitudinal_allowed); controls_allowed and steering are
+    // not affected. Only an rx check, so only reaching this hook, with openpilot longitudinal (see fisker_init).
+    if (msg->addr == 0x214U) {
+      gas_pressed = msg->data[6] > 2U;
+    }
+
     // VCU_0x358: VCU basic cruise state (VCU_Sts_CC_ICC, 4-bit @ start 35 -> data[4]
     // low nibble). The only cruise on cars without ACC coded; only an rx check (so only
     // reaching this hook) with FISKER_PARAM_SP_VCU_BASIC_CRUISE.
@@ -764,14 +773,21 @@ static safety_config fisker_init(uint16_t param) {
     {.msg = {{0x313, 2, 8,  50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  /* ADAS ACC state */ \
     {.msg = {{0x514, 0, 8,  20U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  /* MFSS buttons */
 
-  // Fisker on-vehicle bring-up: honor the LONG_CONTROL bit on release too. Stock openpilot
-  // hides longitudinal behind ALLOW_DEBUG for release builds, but this is a personal test
-  // fork and we need the flag to work so alpha_long can gate 0x121/0x117/0x118 in this
-  // firmware (release-tizi panda is not built with ALLOW_DEBUG). openpilot still gates
-  // openpilotLongitudinalControl behind AlphaLongitudinalEnabled, so this is only reachable
-  // by an explicit developer opt-in.
+  // VCU_0x214 (16 bytes, bus 0) carries the accelerator pedal. It is an rx check only with openpilot longitudinal,
+  // the one thing that uses gas_pressed: an rx check also makes the message a liveness requirement for
+  // controls_allowed and MADS, and steering-only operation must not gain one. Declared like the others: presence,
+  // length and timing only, no checksum / counter validation (the frame has an E2E checksum and alive counter).
+  #define FISKER_LONG_RX_CHECKS \
+    {.msg = {{0x214, 0, 16, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  /* accelerator pedal */
+
+  // openpilot longitudinal is not ready: like the other ports, the LONG_CONTROL bit only counts in debug builds, so
+  // release panda firmware ignores it and never lets 0x121/0x117/0x118 out.
+  SAFETY_UNUSED(param);
+  fisker_longitudinal = false;
+#ifdef ALLOW_DEBUG
   const uint16_t FISKER_FLAG_LONGITUDINAL_CONTROL = 1;
   fisker_longitudinal = GET_FLAG(param, FISKER_FLAG_LONGITUDINAL_CONTROL);
+#endif
   const uint16_t FISKER_PARAM_SP_VCU_BASIC_CRUISE = 1;
   fisker_vcu_basic_cruise = GET_FLAG(current_safety_param_sp, FISKER_PARAM_SP_VCU_BASIC_CRUISE);
   // ADASIS META fix-up: bits 1-2 speed-limit unit, bits 3-4 traffic side, bits 5-14 country
@@ -827,15 +843,24 @@ static safety_config fisker_init(uint16_t param) {
       // VCU_0x358: VCU basic cruise state — the cruise source on cars without ACC coded.
       {.msg = {{0x358, 0, 8,  10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  // VCU basic CC state
     };
+    static RxCheck fisker_vcu_cruise_long_rx_checks[] = {
+      FISKER_COMMON_RX_CHECKS
+      FISKER_LONG_RX_CHECKS
+      {.msg = {{0x358, 0, 8,  10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  // VCU basic CC state
+    };
     // cppcheck-suppress knownConditionTrueFalse
-    ret = fisker_longitudinal ? BUILD_SAFETY_CFG(fisker_vcu_cruise_rx_checks, FISKER_LONG_TX_MSGS)
+    ret = fisker_longitudinal ? BUILD_SAFETY_CFG(fisker_vcu_cruise_long_rx_checks, FISKER_LONG_TX_MSGS)
                               : BUILD_SAFETY_CFG(fisker_vcu_cruise_rx_checks, FISKER_TX_MSGS);
   } else {
     static RxCheck fisker_rx_checks[] = {
       FISKER_COMMON_RX_CHECKS
     };
+    static RxCheck fisker_long_rx_checks[] = {
+      FISKER_COMMON_RX_CHECKS
+      FISKER_LONG_RX_CHECKS
+    };
     // cppcheck-suppress knownConditionTrueFalse
-    ret = fisker_longitudinal ? BUILD_SAFETY_CFG(fisker_rx_checks, FISKER_LONG_TX_MSGS)
+    ret = fisker_longitudinal ? BUILD_SAFETY_CFG(fisker_long_rx_checks, FISKER_LONG_TX_MSGS)
                               : BUILD_SAFETY_CFG(fisker_rx_checks, FISKER_TX_MSGS);
   }
   return ret;
