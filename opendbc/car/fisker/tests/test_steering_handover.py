@@ -530,3 +530,63 @@ class TestSteeringHandover(unittest.TestCase):
     flags = {data[4] & 0x3 for addr, data, bus in frames
              if addr == LAT_CANDIDATE_ADDR and bus == LAT_CANDIDATE_BUS and ((data[4] >> 2) & 0x3F) >= 30}
     assert flags == {5 & 0x3}, flags
+
+
+class TestReleaseAfterTorqueOverride(unittest.TestCase):
+  def test_letting_go_does_not_resume_toward_a_far_target(self):
+    # Route 000000f6 (2026-11-14, left onto Doane St): the driver held the car straight (torque override) while the
+    # command was a leftover left turn; on letting go the controller resumed toward it and steered hard left at 16 mph.
+    cp, sp, cs = _make_car()
+    controller = CarController(DBC[CAR.FISKER_OCEAN], cp, sp)
+    controller.secoc_key_verified = True
+    controller.secoc_key = bytes(16)
+    cc_sp = structs.CarControlSP()
+    cc_sp.mads.active = True
+    controller.was_lat_engaged_prev = True
+    controller.was_lat_active_prev = True
+    controller.was_tx_lateral_prev = True
+    controller.engage_delay_remaining = 0
+    cs.eps_lat_sts = 2
+    cc = structs.CarControl(latActive=True)
+    cc.actuators.steeringAngleDeg = 140.0
+    cs.out = structs.CarState(steeringAngleDeg=11.0, vEgoRaw=6.9, steeringTorque=1.5)
+    cs.driver_intervening = True
+    controller._prev_steer_angle = 11.0
+    controller.apply_angle_last = 11.0
+    controller.update(cc.as_reader(), cc_sp, cs, 0)
+    assert controller._angle_override_latch
+
+    cs.driver_intervening = False                   # the driver lets go
+    cs.out.steeringTorque = 0.0
+    for _ in range(100):
+      controller.update(cc.as_reader(), cc_sp, cs, 0)
+      assert not controller.was_lat_active_prev
+    assert abs(controller.apply_angle_last - 11.0) < 2.0   # the wheel command stays at the wheel
+
+    cc.actuators.steeringAngleDeg = 13.0            # the command comes back near the wheel: steer again
+    for _ in range(controller.ENGAGE_DELAY_TICKS + 3):
+      controller.update(cc.as_reader(), cc_sp, cs, 0)
+    assert controller.was_lat_active_prev
+
+  def test_ordinary_torque_override_still_resumes(self):
+    cp, sp, cs = _make_car()
+    controller = CarController(DBC[CAR.FISKER_OCEAN], cp, sp)
+    controller.secoc_key_verified = True
+    controller.secoc_key = bytes(16)
+    cc_sp = structs.CarControlSP()
+    cc_sp.mads.active = True
+    controller.was_lat_engaged_prev = True
+    controller.was_lat_active_prev = True
+    controller.was_tx_lateral_prev = True
+    controller.engage_delay_remaining = 0
+    cs.eps_lat_sts = 2
+    cc = structs.CarControl(latActive=True)
+    cc.actuators.steeringAngleDeg = 2.0
+    cs.out = structs.CarState(steeringAngleDeg=8.0, vEgoRaw=25.0, steeringTorque=1.5)
+    cs.driver_intervening = True
+    controller.update(cc.as_reader(), cc_sp, cs, 0)
+    assert not controller._angle_override_latch
+    cs.driver_intervening = False
+    for _ in range(controller.ENGAGE_DELAY_TICKS + 3):
+      controller.update(cc.as_reader(), cc_sp, cs, 0)
+    assert controller.was_lat_active_prev

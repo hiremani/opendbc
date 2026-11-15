@@ -455,6 +455,14 @@ class CarController(CarControllerBase):
         and abs(CS.out.steeringTorque) < OVERRIDE_STEER_TORQUE and CS.out.steeringTorque * CS.out.steeringAngleDeg >= 0.0):
       driver_intervening = False
       self._coop_release = True
+    # A torque override with the command far from the wheel latches the angle override too, so letting go of the wheel
+    # does not hand it back until the command is near the wheel again. While the driver holds the wheel,
+    # apply_angle_last follows it, so command_diverge stays small and the check above cannot see a target that ran
+    # away meanwhile. Route 000000f6 (2026-11-14, left onto Doane St): the driver held the car straight against a
+    # leftover turn command; on letting go at 15 mph we resumed toward a target 129 deg left and the wheel reached
+    # 92 deg left in 1.3 s.
+    if driver_intervening and angle_diverge > ANGLE_OVERRIDE_DEG and not coop_turn:
+      self._angle_override_latch = True
     lat_active = (CC.latActive and secoc_ok and not driver_intervening
                   and not standstill_pause and not self._angle_override_latch)
 
