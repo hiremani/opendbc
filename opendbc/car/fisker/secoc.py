@@ -94,6 +94,37 @@ def stamp_secoc(key: bytes, can_id: int, frame8: bytes, trip: int, reset: int, m
   return bytes(buf)
 
 
+def stamp_secoc_many(key: bytes, can_id: int, frames: list[tuple[bytes, int, int, int]]) -> list[bytes]:
+  """stamp_secoc for many frames at once: [(frame8, trip, reset, msg_counter), ...] -> stamped frames, same order.
+
+  Every MAC input here is 14 bytes (DataId 2 + PDU 4 + freshness 8), one padded CMAC block, so all the blocks go
+  through a single AES-ECB call. The candidate windows stamp 11-22 frames per 10 ms tick on the control core (shared
+  with selfdrived and controlsd); one call per frame made card the busiest process there (routes f3/f5, 2026-11-15)."""
+  if not frames:
+    return []
+  ctx = _cmac_cache.get(key)
+  if ctx is None:
+    _cmac24(key, bytes(14))   # fills the cache
+    ctx = _cmac_cache[key]
+  ecb, _k1, k2 = ctx
+  k2i = int.from_bytes(k2, "big")
+  head = struct.pack(">H", can_id & 0xFFFF)
+  blocks = bytearray()
+  bufs = []
+  for frame8, trip, reset, msg_counter in frames:
+    buf = bytearray(frame8[:8].ljust(8, b"\x00"))
+    buf[4] = wire_freshness_byte(msg_counter, reset)
+    m = head + bytes(buf[0:4]) + build_freshness(trip, reset, msg_counter) + b"\x80\x00"
+    blocks += (int.from_bytes(m, "big") ^ k2i).to_bytes(16, "big")
+    bufs.append(buf)
+  enc = ecb.encrypt(bytes(blocks))
+  out = []
+  for i, buf in enumerate(bufs):
+    buf[5:8] = enc[16 * i:16 * i + 3]
+    out.append(bytes(buf))
+  return out
+
+
 # ---- GW freshness-sync message (0x20) -------------------------------------
 
 SYNC_CAN_ID = 0x20

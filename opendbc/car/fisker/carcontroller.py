@@ -8,7 +8,7 @@ from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.lateral import apply_std_steer_angle_limits
 
 from opendbc.car.fisker.fiskercan import FiskerCAN
-from opendbc.car.fisker.secoc import stamp_secoc, sync_mac
+from opendbc.car.fisker.secoc import stamp_secoc, stamp_secoc_many, sync_mac
 from opendbc.car.fisker.values import (ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_RELEASE_DEG, OVERRIDE_STEER_TORQUE,
                                         TURN_COOP_MAX_SPEED, TURN_COOP_UNWIND_DEG,
                                         CarControllerParams, ICC_0x35B_OVERRIDES,
@@ -660,9 +660,12 @@ class CarController(CarControllerBase):
       oem_reset = oem_reset_value(reset, int(CS.oem_1d0_reset_flag))
       # The angle is the same for every candidate, so pack it once and only redo alive + checksum.
       steer_base = self.fcan.create_steering_control(self.apply_angle_last, 0)
-      for secoc_k, alive_k, reset_k in lat_candidates(int(CS.oem_1d0_secoc_full_ctr), int(CS.oem_1d0_alive), oem_reset):
-        steer_msg = self.fcan.steering_control_with_alive(steer_base, alive_k)
-        _addr, stamped, _bus = self._stamp(steer_msg, STEER_CAN_ID, trip, reset_k, secoc_k)
+      # All candidates are signed in one AES call (stamp_secoc_many): per-frame signing made card the busiest
+      # process on the control core.
+      cands = lat_candidates(int(CS.oem_1d0_secoc_full_ctr), int(CS.oem_1d0_alive), oem_reset)
+      frames = [(self.fcan.steering_control_with_alive(steer_base, alive_k)[1], trip, reset_k, secoc_k)
+                for secoc_k, alive_k, reset_k in cands]
+      for stamped in stamp_secoc_many(self.secoc_key, STEER_CAN_ID, frames):
         can_sends.append((LAT_CANDIDATE_ADDR, stamped, LAT_CANDIDATE_BUS))
       can_sends.append(self.fcan.create_lat_control(lat_active_wire, self.alive_1c0,
                                                     driver_override=driver_intervening,
@@ -723,9 +726,10 @@ class CarController(CarControllerBase):
       if accel_active:
         long_reset = oem_reset_value(reset, int(CS.oem_121_reset_flag))
         accel_base = self.fcan.create_accel_command(accel, True, 0, rsv=int(getattr(CS, "oem_121_rsv", 0)))
-        for secoc_k, alive_k, reset_k in lat_candidates(int(CS.oem_121_secoc_full_ctr), int(CS.oem_121_alive), long_reset):
-          accel_msg = self.fcan.steering_control_with_alive(accel_base, alive_k)   # generic: alive + checksum
-          _addr, stamped, _bus = self._stamp(accel_msg, ACCEL_CAN_ID, trip, reset_k, secoc_k)
+        cands = lat_candidates(int(CS.oem_121_secoc_full_ctr), int(CS.oem_121_alive), long_reset)
+        frames = [(self.fcan.steering_control_with_alive(accel_base, alive_k)[1], trip, reset_k, secoc_k)   # generic: alive + checksum
+                  for secoc_k, alive_k, reset_k in cands]
+        for stamped in stamp_secoc_many(self.secoc_key, ACCEL_CAN_ID, frames):
           can_sends.append((LONG_CANDIDATE_ADDR, stamped, LAT_CANDIDATE_BUS))
       self.was_tx_long_prev = accel_active
 
