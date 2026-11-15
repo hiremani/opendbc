@@ -26,6 +26,18 @@ def get_raw_value(dat: bytes | bytearray, sig: Signal) -> int:
   return ret
 
 
+def fast_extractor(sig: Signal) -> tuple[bool, int, int, int]:
+  """(little endian, shift, mask, bytes needed): with the frame read as one integer in the signal's byte order
+  (int.from_bytes(dat, "little") for little endian; for big endian the shift is relative to the frame length, see
+  parse), the signal's raw value is (whole >> shift) & mask. The same bits get_raw_value walks byte by byte."""
+  mask = (1 << sig.size) - 1
+  if sig.is_little_endian:
+    return True, sig.lsb, mask, sig.msb // 8 + 1
+  # big endian: byte i, bit b sits at (n - 1 - i) * 8 + b in int.from_bytes(dat, "big"); stored as -(i * 8) + b and
+  # completed with (n - 1) * 8 at parse time
+  return False, (sig.lsb % 8) - (sig.lsb // 8) * 8, mask, sig.lsb // 8 + 1
+
+
 @dataclass
 class MessageState:
   address: int
@@ -44,6 +56,10 @@ class MessageState:
   counter_fail: int = 0
   first_seen_nanos: int = 0
   last_warning_log_nanos: int = 0
+  fast: list[tuple[bool, int, int, int]] = field(default_factory=list)
+
+  def __post_init__(self):
+    self.fast = [fast_extractor(sig) for sig in self.signals]
 
   def rate_limited_log(self, last_update_nanos: int, msg: str) -> None:
     if (last_update_nanos - self.last_warning_log_nanos) >= 1_000_000_000:
@@ -58,8 +74,19 @@ class MessageState:
     if self.first_seen_nanos == 0:
       self.first_seen_nanos = nanos
 
+    n = len(dat)
+    le = int.from_bytes(dat, "little")
+    be = int.from_bytes(dat, "big")
+    be_base = (n - 1) * 8
+    fast = self.fast
     for i, sig in enumerate(self.signals):
-      tmp = get_raw_value(dat, sig)
+      little, shift, mask, need = fast[i]
+      if need > n:
+        tmp = get_raw_value(dat, sig)   # a short frame: the byte-by-byte walk's partial value
+      elif little:
+        tmp = (le >> shift) & mask
+      else:
+        tmp = (be >> (be_base + shift)) & mask
       if sig.is_signed:
         tmp -= ((tmp >> (sig.size - 1)) & 0x1) * (1 << sig.size)
 
@@ -152,6 +179,7 @@ class CANParser:
     self.can_invalid_cnt: int = CAN_INVALID_CNT
     self.last_nonempty_nanos: int = 0
     self._last_update_nanos: int = 0
+    self._dirty: set[int] = set(self.addresses)
 
   def _add_message(self, name_or_addr: str | int, freq: int | None = None) -> None:
     if isinstance(name_or_addr, numbers.Number):
@@ -217,11 +245,13 @@ class CANParser:
     if strings and not isinstance(strings[0], list | tuple):
       strings = [strings]
 
-    for addr in self.addresses:
-      for k in self.vl_all[addr]:
-        self.vl_all[addr][k].clear()
+    # only the messages updated last time have anything to clear (all_vals is only appended to in parse)
+    for addr in self._dirty:
+      for vals in self.vl_all[addr].values():
+        vals.clear()
 
     updated_addrs: set[int] = set()
+    self._dirty = updated_addrs
     for entry in strings:
       t = entry[0]
       frames = entry[1]
