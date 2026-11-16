@@ -727,6 +727,9 @@ class CarState(CarStateBase):
     self.secoc_sync_seen = True
 
     ret_sp.speedLimit = self.tsr_speed_limit(cp_cam.vl["ADAS_0x311"])
+    # wet road detection (openpilot wet_road.py): both from messages already parsed above, no extra CAN work
+    ret_sp.wiperSpeed = int(bcm335["BCM_FrntWiprSpd"])
+    ret_sp.tractionControlActive = bool(cp_pt.vl["ESP_0x114"]["ESP_ActvSig_TCS"])
 
     return ret, ret_sp
 

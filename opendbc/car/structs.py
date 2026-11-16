@@ -166,3 +166,5 @@ class CarControlSP:
 @auto_dataclass
 class CarStateSP:
   speedLimit: float = auto_field()
+  wiperSpeed: int = auto_field()               # front wipers, wipes a minute (0 = off)
+  tractionControlActive: bool = auto_field()
