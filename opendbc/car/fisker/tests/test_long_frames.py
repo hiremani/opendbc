@@ -118,6 +118,7 @@ def make_long_car():
   cs.oem_121_reset_flag = 5 & 0x3   # OEM's 0x121 is in the GW's window
   cs.oem_121_secoc_full_ctr, cs.oem_121_alive = 40, 7
   cs.oem_121_vld, cs.oem_121_rsv = 1, 0   # the OEM ACC is engaged and commanding
+  cs.adas_acc_state = 3                   # ADAS_Sts_ACC_ICC Active
   return controller, cs
 
 
@@ -173,3 +174,35 @@ class TestLongCandidates(unittest.TestCase):
       setup(cs)
       cands, _ = long_sends(controller, cs, **kw)
       assert not cands, kw
+
+  def test_only_while_the_oem_acc_is_active_or_holding_at_standstill(self):
+    # Standby (2) still carries AccelVld=1 in the OEM frame; Override (4), Deactivation (7, 8) and Failure (9, 10) are
+    # the OEM's too. Active (3) and the standstill states (5, 6, 11) are ours: a stop openpilot made stays held.
+    for state in range(12):
+      controller, cs = make_long_car()
+      cs.adas_acc_state = state
+      cands, _ = long_sends(controller, cs)
+      assert bool(cands) == (state in (3, 5, 6, 11)), state
+
+  def test_handover_logged_once_per_change(self):
+    import logging
+    from opendbc.car.carlog import carlog
+    controller, cs = make_long_car()
+    lines = []
+
+    class Grab(logging.Handler):
+      def emit(self, record):
+        if isinstance(record.msg, dict) and record.msg.get("event") == "fisker_long_handover":
+          lines.append(record.msg)
+    h = Grab()
+    carlog.addHandler(h)
+    try:
+      for _ in range(5):
+        long_sends(controller, cs)
+      long_sends(controller, cs, gas=True)
+      long_sends(controller, cs, gas=True)
+      cs.adas_acc_state = 2
+      long_sends(controller, cs)
+    finally:
+      carlog.removeHandler(h)
+    assert [(x["commanding"], x["gas"], x["acc_state"]) for x in lines] == [(True, False, 3), (False, True, 3), (False, False, 2)]

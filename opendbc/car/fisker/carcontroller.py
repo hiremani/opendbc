@@ -62,6 +62,13 @@ REMOTE_POLL_FRAMES = 10  # re-read the enable gate at ~10 Hz (100 Hz loop)
 # candidate and then rejects it: nothing is ever transmitted there.
 LAT_CANDIDATE_ADDR = 0x5D0   # carries an 0x1D0 payload; panda-internal (never on a real bus)
 LONG_CANDIDATE_ADDR = 0x521  # carries an 0x121 payload; panda-internal, same bus and handling as 0x5D0
+# ADAS_Sts_ACC_ICC states in which openpilot's accel replaces the OEM ACC's: Active (3) and the standstill states
+# (5 Standstill_active, 6 Standstill_wait, 11 Standstill_GoNotification). Not Standby (2): the OEM 0x121 carries
+# AccelVld=1 even in Standby (DBC note), so the valid bit alone does not mean the ACC is commanding. Not Override (4,
+# the driver's foot), the Deactivation states (7, 8) or Failure (9, 10): there the OEM's own frame goes through.
+# The standstill states stay ours: openpilot may have stopped the car where the OEM ACC saw no reason to (a stop
+# sign), and handing its frame back at a standstill could let it pull away toward the set speed.
+ACC_COMMANDING_STATES = (3, 5, 6, 11)
 LAT_CANDIDATE_BUS = 1        # addressed to the MRR link; panda rejects it after buffering
 # The window has to cover the whole round trip: OEM frame -> panda -> pandad -> card ->
 # sendcan -> panda. Candidate k is used ~(10*k - latency) ms after it reaches panda, and
@@ -180,15 +187,13 @@ class CarController(CarControllerBase):
 
     # Longitudinal sends only 0x121 candidates, stamped with OEM 0x121's own alive / SecOC counters (lat_candidates).
     self.was_tx_long_prev = False   # 0x121 candidates sent last tick
+    self._long_trace = None          # last logged speed-control handover state (fisker_long_handover)
 
     self.secoc_key_verified = False
     self.secoc_warn_logged = False
 
-    # Once openpilot has been long-active at least once, keep the ADAS heartbeat going for
-    # the rest of the drive. If we go silent between engagements the ESP loses our 0x118 AEB
-    # state (falls into "AEB unavailable" fault) and the VCU's E2E AliveCounter validator
-    # rejects our first re-engage frames as out-of-sequence — surfacing as "ADAS error,
-    # emergency brake unavailable" on the cluster and a cruise fault in openpilot.
+    # openpilot longitudinal was active at least once this drive (informational; the old own-frame design kept a
+    # 0x118 heartbeat going from here, modify-and-forward sends no frames of its own).
     self.long_ever_active = False
 
     # "We ARE OEM" AliveCounter substitution: every OEM 0x1D0/0x1C0 tick that panda
@@ -735,15 +740,16 @@ class CarController(CarControllerBase):
     # otherwise OEM's frame passes through unchanged. So openpilot's accel replaces the OEM ACC's accel and nothing
     # else changes on the bus: the same sender, counters and status the VCU sees under stock ACC.
     #
-    # Commanding needs the OEM ACC engaged and commanding (OEM AccelVld = 1, which also means its 0x117 says Active),
-    # openpilot longitudinal active, and the driver off the gas (then OEM's own frame, its override handling, goes
-    # through untouched).
+    # Commanding needs the OEM ACC engaged (ADAS_Sts_ACC_ICC in ACC_COMMANDING_STATES) with a valid request in its
+    # frame (AccelVld = 1), openpilot longitudinal active, and the driver off the gas (then OEM's own frame, its
+    # override handling, goes through untouched).
     if self.CP.openpilotLongitudinalControl:
       # The VCU withdrew VCU_ACCRdy mid-engagement (carstate.vcu_acc_rdy_lost): it is not taking requests, so stop
       # commanding. accFaulted disengages openpilot as well.
       long_active = CC.longActive and secoc_ok and not CS.vcu_acc_rdy_lost
       gas_override = CS.out.gasPressed
-      accel_active = long_active and not gas_override and int(getattr(CS, "oem_121_vld", 0)) == 1
+      acc_commanding = int(getattr(CS, "adas_acc_state", 0)) in ACC_COMMANDING_STATES
+      accel_active = long_active and not gas_override and acc_commanding and int(getattr(CS, "oem_121_vld", 0)) == 1
       # Jerk-limited request (apply_fisker_accel_limits): 0.0 at once when not commanding; on the first commanding
       # frame the speed-derived measured accel, so there is no step at engage or after a gas override; then at most
       # ACCEL_JERK_UP / ACCEL_JERK_DOWN per frame toward openpilot's accel.
@@ -762,6 +768,16 @@ class CarController(CarControllerBase):
         for stamped in stamp_secoc_many(self.secoc_key, ACCEL_CAN_ID, frames):
           can_sends.append((LONG_CANDIDATE_ADDR, stamped, LAT_CANDIDATE_BUS))
       self.was_tx_long_prev = accel_active
+      # Speed-control handover trace: one line whenever who drives the 0x121 changes, and why (cheap: a tuple compare
+      # per tick). Phase 0 of the speed control plan: the drive log has to say when the swap ran and when it stopped.
+      trace = (bool(accel_active), bool(CC.longActive), bool(secoc_ok), bool(CS.vcu_acc_rdy_lost), bool(gas_override),
+               int(getattr(CS, "adas_acc_state", -1)), int(getattr(CS, "oem_121_vld", -1)))
+      if trace != self._long_trace:
+        self._long_trace = trace
+        carlog.info({"event": "fisker_long_handover", "commanding": trace[0], "long_active": trace[1], "secoc_ok": trace[2],
+                     "vcu_acc_rdy_lost": trace[3], "gas": trace[4], "acc_state": trace[5], "oem_vld": trace[6],
+                     "accel": round(accel, 3), "want": round(float(actuators.accel), 3), "a_ego": round(CS.a_ego_wheel, 3),
+                     "v": round(CS.out.vEgoRaw, 2)})
 
     # ---- ICC SVS / BSD / APA settings (0x35B, ICC on bus 0 -> ADAS module on bus 2) ----
     # Optional: only relayed when ICC_0x35B_OVERRIDES has entries. Panda blocks the ICC's own

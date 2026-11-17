@@ -10,9 +10,10 @@
 // Buses: ADASBUS = bus 0.
 //   TX  0x1D0  ADAS_LatCtrl_SteerAnReq    steering angle (SecOC)
 //   TX  0x1C0  ADAS_LatCtrl activation    plain E2E, lateral activation/status
-//   TX  0x121  ADAS_LgtCtrl_AccelReq      accel (SecOC, longitudinal only)
-//   TX  0x117  ADAS long control status   plain E2E, Sts/Typ (CC -> ACC transition)
-//   TX  0x118  ADAS long/ESP handshake    plain E2E, ESP-side mirror + jerk/prefill/AEB
+//   TX  0x5D0  0x1D0 candidates (bus 1, buffered, never sent; swapped into OEM 0x1D0 by fisker_fwd_modify)
+//   TX  0x521  0x121 candidates (bus 1, buffered, never sent; longitudinal only, debug builds only): openpilot's
+//              accel swapped into the OEM ADAS's own 0x121 by fisker_fwd_modify. openpilot never sends 0x121,
+//              0x117 or 0x118 of its own; the OEM's always reach the car.
 //   TX  0x52A  ICC settings spoof         bus 2 (to ADAS); plain E2E — see below
 //   RX  0x115  wheel speeds -> vehicle_moving
 //   RX  0x318  vehicle speed + brake pedal
@@ -73,35 +74,6 @@ static uint32_t fisker_lat_tx_last = 0U;
 
 static bool fisker_lat_relay_active(void) {
   return safety_get_ts_elapsed(microsecond_timer_get(), fisker_lat_tx_last) < FISKER_LAT_RELAY_TIMEOUT_US;
-}
-
-// Longitudinal TX relay (openpilot long only): the same idea for 0x121 / 0x117 / 0x118. The OEM's copy of each is
-// blocked bus 2 -> bus 0 only while openpilot's own copy of THAT message passed the tx hook in the last
-// FISKER_LONG_RELAY_TIMEOUT_US, so the VCU/ESP always see exactly one sender: ours while carcontroller sends (the
-// whole engaged window and the heartbeat after it), the OEM's otherwise. Per message, so a 0x121 the accel check
-// rejects doesn't also silence the OEM's. This replaced "block OEM 0x121 while controls_allowed", which let both
-// 0x121 streams through whenever we sent with controls not allowed, and never blocked 0x117/0x118 at all.
-#define FISKER_LONG_RELAY_TIMEOUT_US 60000U
-static uint32_t fisker_long_121_tx_last = 0U;
-static uint32_t fisker_long_117_tx_last = 0U;
-static uint32_t fisker_long_118_tx_last = 0U;
-static bool fisker_long_121_tx_seen = false;
-static bool fisker_long_117_tx_seen = false;
-static bool fisker_long_118_tx_seen = false;
-
-static bool fisker_long_relay_active(int addr) {
-  bool active = false;
-  uint32_t now = microsecond_timer_get();
-  if (addr == 0x121) {
-    active = fisker_long_121_tx_seen && (safety_get_ts_elapsed(now, fisker_long_121_tx_last) < FISKER_LONG_RELAY_TIMEOUT_US);
-  } else if (addr == 0x117) {
-    active = fisker_long_117_tx_seen && (safety_get_ts_elapsed(now, fisker_long_117_tx_last) < FISKER_LONG_RELAY_TIMEOUT_US);
-  } else if (addr == 0x118) {
-    active = fisker_long_118_tx_seen && (safety_get_ts_elapsed(now, fisker_long_118_tx_last) < FISKER_LONG_RELAY_TIMEOUT_US);
-  } else {
-    active = false;
-  }
-  return active;
 }
 
 // ---- 0x1D0 candidate substitution (race-free SecOC handover) --------------------
@@ -643,37 +615,6 @@ static bool fisker_tx_hook(const CANPacket_t *msg) {
     }
   }
 
-  // Accel command (0x121). Only in the TX list with openpilot longitudinal, so without
-  // it the frame never reaches this hook.
-  if (msg->addr == 0x121U) {
-    int raw_accel = (msg->data[2] << 8) | msg->data[3];
-    if (longitudinal_accel_checks(raw_accel, FISKER_LONG_LIMITS)) {
-      tx = false;
-    }
-  }
-
-  // Long status (0x117) / ESP handshake (0x118): openpilot only ever asks for plain ACC through 0x121. Every request
-  // here that could move or hold the car on its own must stay 0 (fiskercan.py always sends 0): park gear, emergency
-  // EPB, emergency / park standstill on 0x117; brake assist (HBA), brake prefill, AEB activation and ESP standstill
-  // on 0x118. Bit positions are the DBC's (Motorola: byte = start / 8).
-  if (msg->addr == 0x117U) {
-    bool park_gear_req = (msg->data[4] & 0x0FU) != 0U;           // ADAS_ParkGearReq 35|4
-    bool emgy_epb_req = (msg->data[5] & 0x10U) != 0U;            // ADAS_HAP_EmgyEPBReq 44|1
-    bool standstill_reqs = (msg->data[3] & 0x30U) != 0U;         // ADAS_HAP_EmgyStandstillReq 28|1, ADAS_ParkStandstillReq 29|1
-    if (park_gear_req || emgy_epb_req || standstill_reqs) {
-      tx = false;
-    }
-  }
-  if (msg->addr == 0x118U) {
-    bool hba_req = (msg->data[3] & 0x07U) != 0U;                 // ADAS_HBAReq 26|3
-    bool esp_standstill_req = (msg->data[3] & 0x20U) != 0U;      // ADAS_ESP_StandstillReq 29|1
-    bool prefill_req = (msg->data[4] & 0x30U) != 0U;             // ADAS_BrkPrefillReq 37|2
-    bool aeb_actv = (msg->data[5] & 0x0FU) != 0U;                // ADAS_AEB_ActvTyp 43|4
-    if (hba_req || esp_standstill_req || prefill_req || aeb_actv) {
-      tx = false;
-    }
-  }
-
   // 0x1D0 candidate pool (0x5D0 on bus 1). Each candidate is a fully-stamped 0x1D0
   // payload for the counter in its byte 4. Validate the angle with the SAME limits as a
   // direct 0x1D0 (panda's actuator-rate safety must still hold — the angle reaches the
@@ -738,20 +679,6 @@ static bool fisker_tx_hook(const CANPacket_t *msg) {
   // now handled by the candidate pool above, not a direct bus-0 TX.)
   if ((msg->addr == 0x1C0U) && (msg->bus == 0U)) {
     fisker_lat_tx_last = microsecond_timer_get();
-  }
-  // Longitudinal relay: only frames that actually go out count (see fisker_long_relay_active).
-  if (tx && (msg->bus == 0U)) {
-    if (msg->addr == 0x121U) {
-      fisker_long_121_tx_last = microsecond_timer_get();
-      fisker_long_121_tx_seen = true;
-    } else if (msg->addr == 0x117U) {
-      fisker_long_117_tx_last = microsecond_timer_get();
-      fisker_long_117_tx_seen = true;
-    } else if (msg->addr == 0x118U) {
-      fisker_long_118_tx_last = microsecond_timer_get();
-      fisker_long_118_tx_seen = true;
-    } else {
-    }
   }
 
   return tx;
@@ -867,7 +794,7 @@ static safety_config fisker_init(uint16_t param) {
     {.msg = {{0x214, 0, 16, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  /* accelerator pedal */
 
   // openpilot longitudinal is not ready: like the other ports, the LONG_CONTROL bit only counts in debug builds, so
-  // release panda firmware ignores it and never lets 0x121/0x117/0x118 out.
+  // release panda firmware ignores it and never swaps openpilot's accel into the OEM's 0x121.
   SAFETY_UNUSED(param);
   fisker_longitudinal = false;
 #ifdef ALLOW_DEBUG
@@ -913,13 +840,6 @@ static safety_config fisker_init(uint16_t param) {
   // Lateral relay stays idle at init — carcontroller only starts TXing lateral
   // when MADS engages, and we want OEM 0x1D0/0x1C0 to flow through until then.
   fisker_lat_tx_last = 0U;
-  // Longitudinal relays idle at init: the OEM's 0x121/0x117/0x118 flow until we send our own.
-  fisker_long_121_tx_last = 0U;
-  fisker_long_117_tx_last = 0U;
-  fisker_long_118_tx_last = 0U;
-  fisker_long_121_tx_seen = false;
-  fisker_long_117_tx_seen = false;
-  fisker_long_118_tx_seen = false;
 
   safety_config ret;
   if (fisker_vcu_basic_cruise) {
@@ -975,11 +895,6 @@ static bool fisker_fwd_hook(int bus_num, int addr) {
     // substitute our candidate (when armed) or pass OEM's through (when disarmed). The
     // modify hook drops it when armed-but-no-candidate, so OEM's raw 0x1D0 never reaches
     // the EPS during engagement.
-    // Longitudinal (0x121 / 0x117 / 0x118, openpilot long only): per-message time-based relay, see
-    // fisker_long_relay_active. MADS doesn't enter into it; it's whether we are sending.
-    if (fisker_longitudinal && fisker_long_relay_active(addr)) {
-      block_msg = true;
-    }
   }
   if (bus_num == 0) {
     // ICC settings spoof (0x52A, ICC → ADAS/FCM): block the real ICC_0x52A from

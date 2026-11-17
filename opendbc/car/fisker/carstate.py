@@ -200,6 +200,7 @@ class CarState(CarStateBase):
     # 0x121's SecOC counter is rebuilt from its own fresh byte exactly like 0x1D0's above.
     self.oem_121_alive = 0
     self.oem_121_vld = 0
+    self.adas_acc_state = 0          # ADAS_Sts_ACC_ICC (0x313)
     self.oem_121_rsv = 0
     self.oem_117_alive = 0
     self.oem_118_alive = 0
@@ -516,6 +517,7 @@ class CarState(CarStateBase):
     adas313 = cp_cam.vl["ADAS_0x313"]
     adas31c = cp_cam.vl["ADAS_0x31C"]
     cc_state = int(adas313["ADAS_Sts_ACC_ICC"])
+    self.adas_acc_state = cc_state   # carcontroller: openpilot's accel only replaces the OEM's in ACC_COMMANDING_STATES
     cc_disp = adas31c["ADAS_AccTrgSpdDisp"]
     cc_speed = 0.0 if cc_disp >= 255 else cc_disp * icc_to_ms
 
