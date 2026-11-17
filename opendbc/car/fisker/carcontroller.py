@@ -168,6 +168,7 @@ class CarController(CarControllerBase):
     super().__init__(dbc_names, CP, CP_SP)
     self.params = CarControllerParams
     self.packer = CANPacker(dbc_names[Bus.pt])
+    self._handover_trace = None   # last logged handover state (fisker_lat_handover)
     self.fcan = FiskerCAN(CP, self.packer)
 
     self.apply_angle_last = 0.0
@@ -637,6 +638,23 @@ class CarController(CarControllerBase):
         self.alive_1d0 = (self.alive_1d0 + 1) % 15
         self.alive_1c0 = (self.alive_1c0 + 1) % 15
     self.was_tx_lateral_prev = tx_lateral
+
+    # Handover trace (2026-11-17: on signaled turns the EPS sat at "available" instead of "active" while we requested
+    # control, and the driver steered the turn; nothing in the log said which of the latches below let go, or why).
+    # One line whenever one of them changes while engaged: cheap (a tuple compare per tick, a log line per change).
+    if lat_engaged:
+      trace = (bool(tx_lateral), bool(lat_active), bool(driver_intervening), bool(getattr(CS, "torque_latch_only", False)),
+               bool(self._angle_override_latch), bool(self._override_eps_recovery), bool(coop_turn),
+               int(getattr(CS, "eps_lat_sts", -1)), int(getattr(CS, "eps_abort", -1)))
+      if trace != self._handover_trace:
+        self._handover_trace = trace
+        carlog.info({"event": "fisker_lat_handover", "tx": trace[0], "lat_active": trace[1], "intervening": trace[2],
+                     "torque_latch_only": trace[3], "angle_latch": trace[4], "eps_recovery": trace[5], "coop": trace[6],
+                     "eps_sts": trace[7], "eps_abort": trace[8], "wheel": round(CS.out.steeringAngleDeg, 1),
+                     "want": round(desired_angle_deg, 1), "torque": round(CS.out.steeringTorque, 2),
+                     "v": round(CS.out.vEgoRaw, 2)})
+    else:
+      self._handover_trace = None
 
     if tx_lateral:
       # alive_1c0 was seeded/incremented just above; 0x1D0 candidates carry OEM's own counters.
