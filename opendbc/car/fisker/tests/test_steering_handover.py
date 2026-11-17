@@ -6,14 +6,15 @@ import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import Bus, structs
 from opendbc.car.fisker.carcontroller import (CarController, LAT_CANDIDATE_ADDR, LAT_CANDIDATE_BUS,
-                                              apply_fisker_steer_angle_limits)
+                                              apply_fisker_steer_angle_limits, learn_angle_trim)
 from opendbc.car.fisker.carstate import CarState
 from opendbc.car.fisker.interface import CarInterface
 from opendbc.car.fisker.values import (ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_RELEASE_DEG, CANBUS, CAR,
                                         DBC, OVERRIDE_RELEASE_FRAMES, OVERRIDE_RELEASE_TORQUE,
                                         OVERRIDE_STEER_TORQUE, OVERRIDE_TRIP_FRAMES)
 from opendbc.car.lateral import apply_std_steer_angle_limits
-from opendbc.car.fisker.values import CarControllerParams, LAT_ANGLE_CMD_MAX
+from opendbc.car.fisker.values import (ANGLE_TRIM_DEG, ANGLE_TRIM_MAX, ANGLE_TRIM_MIN, CarControllerParams,
+                                        LAT_ANGLE_CMD_MAX)
 from opendbc.testing import parameterized
 
 
@@ -606,3 +607,83 @@ class TestReleaseAfterTorqueOverride(unittest.TestCase):
     for _ in range(controller.ENGAGE_DELAY_TICKS + 3):
       controller.update(cc.as_reader(), cc_sp, cs, 0)
     assert controller.was_lat_active_prev
+
+
+def _drive_straight(offset, seconds, trim=ANGLE_TRIM_DEG, learn=True, desired=0.0, v=27.0):
+  """openpilot holds `desired` while the EPS settles the wheel at sent + offset (first-order, 0.15 s).
+  Returns the final wheel angle and trim."""
+  sent, wheel = 0.0, 0.0
+  sent_prev, step_prev = 0.0, 0.0
+  for _ in range(int(seconds * 100)):
+    if learn:
+      trim = learn_angle_trim(trim, wheel, sent_prev, step_prev, v, True)
+    sent = apply_fisker_steer_angle_limits(desired, sent, v, wheel, True, True, trim if learn or trim else 0.0)
+    wheel += (sent + offset - wheel) * (0.01 / 0.15)
+    step_prev, sent_prev = sent - sent_prev, sent
+  return wheel, trim
+
+
+class TestAngleTrim(unittest.TestCase):
+  # route 00000106 (2026-11-17): the wheel settled ~0.8 deg left of every command, the car sat 30 cm left of centre
+  def test_wheel_ends_where_openpilot_asked(self):
+    wheel, _ = _drive_straight(0.85, 10)
+    assert abs(wheel) < 0.05, wheel
+
+  def test_without_trim_the_wheel_sits_left(self):
+    # the old behaviour, for contrast: the offset goes straight to the wheel
+    wheel, _ = _drive_straight(0.85, 10, trim=0.0, learn=False)
+    assert abs(wheel - 0.85) < 0.05, wheel
+
+  @parameterized('offset', [0.5, 1.1])
+  def test_learns_this_cars_offset(self, offset):
+    wheel, trim = _drive_straight(offset, 120)
+    assert abs(trim - offset) < 0.05, trim
+    assert abs(wheel) < 0.05, wheel
+
+  def test_trim_stays_in_its_band(self):
+    _, trim = _drive_straight(3.0, 300)   # a wheel held far off (not this car's offset): bounded
+    assert ANGLE_TRIM_MIN <= trim <= ANGLE_TRIM_MAX
+    t = ANGLE_TRIM_DEG
+    for _ in range(100000):
+      t = learn_angle_trim(t, t + 0.9, 0.0, 0.0, 27.0, True)
+    assert t == ANGLE_TRIM_MAX
+    for _ in range(100000):
+      t = learn_angle_trim(t, t - 0.9, 0.0, 0.0, 27.0, True)
+    assert t == ANGLE_TRIM_MIN
+
+  @parameterized('wheel, sent, step, v, ok', [
+    (1.5, 0.0, 0.0, 27.0, False),   # driver on the wheel / not steering
+    (1.5, 0.0, 0.0, 5.0, True),     # too slow
+    (6.0, 5.0, 0.0, 27.0, True),    # turning, not near straight
+    (1.5, 0.0, 0.05, 27.0, True),   # command still moving: the wheel lags it
+  ])
+  def test_no_learning_outside_steady_straight_driving(self, wheel, sent, step, v, ok):
+    assert learn_angle_trim(ANGLE_TRIM_DEG, wheel, sent, step, v, ok) == ANGLE_TRIM_DEG
+
+  def test_trim_never_moves_the_heartbeat(self):
+    # not steering: the frame carries the measured wheel, untouched
+    assert apply_fisker_steer_angle_limits(5.0, 3.0, 20.0, 3.0, False, True, ANGLE_TRIM_DEG) == 3.0
+
+  def test_trim_respects_the_rate_limit(self):
+    # engaging at speed: the trimmed target is reached at the normal rate, never in one step
+    up = CarControllerParams.ANGLE_LIMITS.ANGLE_RATE_LIMIT_DOWN[1][-1]
+    nxt = apply_fisker_steer_angle_limits(0.0, 0.0, 30.0, 0.0, True, True, ANGLE_TRIM_DEG)
+    assert abs(nxt) <= up + 1e-9
+
+  def test_controller_sends_command_minus_trim(self):
+    cp, sp, cs = _make_car()
+    controller = CarController(DBC[CAR.FISKER_OCEAN], cp, sp)
+    controller.secoc_key_verified = True
+    controller.secoc_key = bytes(16)
+    controller.apply_angle_last = 2.0 - ANGLE_TRIM_DEG
+    controller.was_lat_engaged_prev = True
+    controller.was_tx_lateral_prev = True
+    controller.was_lat_active_prev = True
+    cs.out = structs.CarState(steeringAngleDeg=2.0, vEgoRaw=27.0, vEgo=27.0)
+    cs.eps_lat_sts = 2
+    cc = structs.CarControl(latActive=True)
+    cc.actuators.steeringAngleDeg = 2.0
+    cc_sp = structs.CarControlSP()
+    cc_sp.mads.active = True
+    controller.update(cc.as_reader(), cc_sp, cs, 0)
+    assert abs(controller.apply_angle_last - (2.0 - controller.angle_trim)) < 1e-6

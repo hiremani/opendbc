@@ -278,6 +278,21 @@ SETTLE_MAX_TICKS = 150    # ~1.5 s
 # command is capped: while not steering, the angle follows the measured wheel wherever it is (the panda checks that).
 LAT_ANGLE_CMD_MAX = 400.0          # deg
 
+# Command trim. The wheel settles about 0.85 deg left of the 0x1D0 angle we send, at every speed and command size
+# (wheel minus command, median over |command| < 2 deg: +0.95 f5, +0.75 fe, +0.93 101, +0.82 105, +0.79 106). openpilot's
+# angle controller has no integral, so the car went straight with the wheel at +0.5 deg while openpilot asked for
+# -0.3 deg, and sat 30 cm left of the lane centre on the freeway (route 00000106, 2026-11-17: lane centre +0.33 m right
+# of the car under openpilot, +0.02 m when the driver steered). We send the command minus this trim, and keep learning
+# it slowly while openpilot holds the wheel steady at small angles, within MIN..MAX.
+ANGLE_TRIM_DEG = 0.85              # deg, starting value
+ANGLE_TRIM_MIN = 0.3               # deg
+ANGLE_TRIM_MAX = 1.5               # deg
+ANGLE_TRIM_TAU_S = 20.0            # s of steady driving to move most of the way to a new value
+ANGLE_TRIM_MIN_SPEED = 9.0         # m/s: below this the wheel moves too much to learn from
+ANGLE_TRIM_MAX_CMD = 3.0           # deg: learn only near straight ahead
+ANGLE_TRIM_STEADY_STEP = 0.005     # deg per 10 ms: the command must be this still (lag error under 0.1 deg)
+ANGLE_TRIM_MAX_JUMP = 1.0          # deg: a sample this far from the current trim is not the offset (ignored)
+
 # Angle-divergence override: when the measured wheel is turned this far (deg) from the angle
 # the model is commanding, the driver is clearly steering independently (hard manual input /
 # U-turn) even if column torque stayed under OVERRIDE_STEER_TORQUE because the EPS was power-

@@ -9,6 +9,8 @@ from opendbc.car.lateral import apply_std_steer_angle_limits
 from opendbc.car.fisker.fiskercan import FiskerCAN
 from opendbc.car.fisker.secoc import stamp_secoc, stamp_secoc_many, sync_mac
 from opendbc.car.fisker.values import (ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_RELEASE_DEG, OVERRIDE_STEER_TORQUE,
+                                        ANGLE_TRIM_DEG, ANGLE_TRIM_MAX, ANGLE_TRIM_MAX_CMD, ANGLE_TRIM_MAX_JUMP,
+                                        ANGLE_TRIM_MIN, ANGLE_TRIM_MIN_SPEED, ANGLE_TRIM_STEADY_STEP, ANGLE_TRIM_TAU_S,
                                         LAT_ANGLE_CMD_MAX, TURN_COOP_MAX_SPEED, TURN_COOP_UNWIND_DEG,
                                         CarControllerParams, ICC_0x35B_OVERRIDES,
                                         SETTLE_ANGLE_STEP, SETTLE_MAX_TICKS, STANDSTILL_PAUSE_SPEED)
@@ -160,12 +162,26 @@ def coop_signaled_turn(desired_angle, wheel_angle, wheel_step, v_ego, left_blink
   return toward and abs(desired_angle) >= abs(wheel_angle) - ANGLE_OVERRIDE_RELEASE_DEG
 
 
-def apply_fisker_steer_angle_limits(desired_angle, last_angle, speed, measured_angle, lat_active, controls_permitted):
+def learn_angle_trim(trim, wheel_angle, sent_angle, sent_step, v_ego, sample_ok):
+  """The wheel settles at the sent angle plus an offset (values.ANGLE_TRIM_DEG). Move the estimate toward
+  wheel - sent, only while we steer steadily near straight ahead and the driver is off the wheel."""
+  if not sample_ok or v_ego < ANGLE_TRIM_MIN_SPEED or abs(sent_angle) > ANGLE_TRIM_MAX_CMD \
+     or abs(sent_step) > ANGLE_TRIM_STEADY_STEP:
+    return trim
+  err = wheel_angle - sent_angle
+  if abs(err - trim) > ANGLE_TRIM_MAX_JUMP:
+    return trim
+  return _clip(trim + (err - trim) * (DT_CTRL / ANGLE_TRIM_TAU_S), ANGLE_TRIM_MIN, ANGLE_TRIM_MAX)
+
+
+def apply_fisker_steer_angle_limits(desired_angle, last_angle, speed, measured_angle, lat_active, controls_permitted,
+                                    trim=0.0):
   # Req=0 releases the EPS, but Panda still rate-checks 0x1D0 while ACC/MADS permits
   # control. Follow the driver's measured angle at the normal rate instead of
   # snapping to it and dropping frames at Panda. With both permissions off, Panda
   # requires a measured-angle heartbeat instead.
-  target = _clip(desired_angle, -LAT_ANGLE_CMD_MAX, LAT_ANGLE_CMD_MAX) if lat_active else measured_angle
+  # trim: the wheel settles this far left of what we send, so send that much less (values.ANGLE_TRIM_DEG).
+  target = _clip(desired_angle - trim, -LAT_ANGLE_CMD_MAX, LAT_ANGLE_CMD_MAX) if lat_active else measured_angle
   return apply_std_steer_angle_limits(target, last_angle, speed, measured_angle,
                                      controls_permitted, CarControllerParams.ANGLE_LIMITS)
 
@@ -179,6 +195,11 @@ class CarController(CarControllerBase):
     self.fcan = FiskerCAN(CP, self.packer)
 
     self.apply_angle_last = 0.0
+    # command trim (learn_angle_trim): the wheel settles this far left of the angle we send
+    self.angle_trim = ANGLE_TRIM_DEG
+    self._trim_sample_ok = False   # last tick we sent a steady command with the driver off the wheel
+    self._trim_sent_prev = 0.0     # the angle sent last tick
+    self._trim_step_prev = 0.0     # how much it moved from the tick before
 
     # 0x121 accel request after the jerk limiter (apply_fisker_accel_limits), and whether the last
     # frame was actively commanding (the limiter restarts from the measured accel when it was not).
@@ -511,9 +532,13 @@ class CarController(CarControllerBase):
     # slewing to the measured angle at the normal rate while ACC or MADS still permits
     # control, so Panda's rate check keeps accepting the frames; with neither permission
     # it carries the measured angle as the heartbeat.
+    # Learn the trim from last tick's command against the wheel now (one tick behind, the command was steady).
+    self.angle_trim = learn_angle_trim(self.angle_trim, CS.out.steeringAngleDeg, self._trim_sent_prev,
+                                       self._trim_step_prev, CS.out.vEgoRaw,
+                                       self._trim_sample_ok and lat_active and not CS.out.steeringPressed)
     self.apply_angle_last = apply_fisker_steer_angle_limits(
       desired_angle_deg, self.apply_angle_last, CS.out.vEgoRaw,
-      CS.out.steeringAngleDeg, lat_active, engaged,
+      CS.out.steeringAngleDeg, lat_active, engaged, self.angle_trim,
     )
 
     # "We ARE OEM" counter continuation. The lateral counters (alive_1c0, and the 0x1D0
@@ -643,6 +668,9 @@ class CarController(CarControllerBase):
         self.alive_1d0 = (self.alive_1d0 + 1) % 15
         self.alive_1c0 = (self.alive_1c0 + 1) % 15
     self.was_tx_lateral_prev = tx_lateral
+    self._trim_step_prev = self.apply_angle_last - self._trim_sent_prev
+    self._trim_sent_prev = self.apply_angle_last
+    self._trim_sample_ok = tx_lateral and lat_active
 
     # Handover trace (2026-11-17: on signaled turns the EPS sat at "available" instead of "active" while we requested
     # control, and the driver steered the turn; nothing in the log said which of the latches below let go, or why).
