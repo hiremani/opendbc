@@ -271,6 +271,13 @@ STANDSTILL_PAUSE_SPEED = 0.447  # m/s
 SETTLE_ANGLE_STEP = 0.2   # deg/tick
 SETTLE_MAX_TICKS = 150    # ~1.5 s
 
+# The most wheel angle openpilot itself asks for (deg). The EPS aborts near full lock (~470 deg): on 2026-10-27 and on
+# route 00000103 (2026-11-16, a 5 mph left turn: the model asked for 460 deg with the wheel at 445, AbortFb=9 and a
+# permanent LKAS fault, and the car's own cruise then pulled away at +2.5 m/s^2). The turn assist's tightest arc needs
+# ~280 deg. A driver who wants more turns the wheel past this and the angle-divergence override yields to them. Only the
+# command is capped: while not steering, the angle follows the measured wheel wherever it is (the panda checks that).
+LAT_ANGLE_CMD_MAX = 400.0          # deg
+
 # Angle-divergence override: when the measured wheel is turned this far (deg) from the angle
 # the model is commanding, the driver is clearly steering independently (hard manual input /
 # U-turn) even if column torque stayed under OVERRIDE_STEER_TORQUE because the EPS was power-

@@ -9,7 +9,7 @@ from opendbc.car.lateral import apply_std_steer_angle_limits
 from opendbc.car.fisker.fiskercan import FiskerCAN
 from opendbc.car.fisker.secoc import stamp_secoc, stamp_secoc_many, sync_mac
 from opendbc.car.fisker.values import (ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_RELEASE_DEG, OVERRIDE_STEER_TORQUE,
-                                        TURN_COOP_MAX_SPEED, TURN_COOP_UNWIND_DEG,
+                                        LAT_ANGLE_CMD_MAX, TURN_COOP_MAX_SPEED, TURN_COOP_UNWIND_DEG,
                                         CarControllerParams, ICC_0x35B_OVERRIDES,
                                         SETTLE_ANGLE_STEP, SETTLE_MAX_TICKS, STANDSTILL_PAUSE_SPEED)
 from opendbc.sunnypilot.car.fisker.values_ext import FiskerFlagsSP
@@ -165,7 +165,7 @@ def apply_fisker_steer_angle_limits(desired_angle, last_angle, speed, measured_a
   # control. Follow the driver's measured angle at the normal rate instead of
   # snapping to it and dropping frames at Panda. With both permissions off, Panda
   # requires a measured-angle heartbeat instead.
-  target = desired_angle if lat_active else measured_angle
+  target = _clip(desired_angle, -LAT_ANGLE_CMD_MAX, LAT_ANGLE_CMD_MAX) if lat_active else measured_angle
   return apply_std_steer_angle_limits(target, last_angle, speed, measured_angle,
                                      controls_permitted, CarControllerParams.ANGLE_LIMITS)
 

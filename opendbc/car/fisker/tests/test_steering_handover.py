@@ -13,7 +13,7 @@ from opendbc.car.fisker.values import (ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_RELEAS
                                         DBC, OVERRIDE_RELEASE_FRAMES, OVERRIDE_RELEASE_TORQUE,
                                         OVERRIDE_STEER_TORQUE, OVERRIDE_TRIP_FRAMES)
 from opendbc.car.lateral import apply_std_steer_angle_limits
-from opendbc.car.fisker.values import CarControllerParams
+from opendbc.car.fisker.values import CarControllerParams, LAT_ANGLE_CMD_MAX
 from opendbc.testing import parameterized
 
 
@@ -78,6 +78,22 @@ class TestSteeringHandover(unittest.TestCase):
   def test_active_limits_unchanged(self, speed, last, target):
     assert apply_fisker_steer_angle_limits(target, last, speed, 0, True, True) == apply_std_steer_angle_limits(
       target, last, speed, 0, True, CarControllerParams.ANGLE_LIMITS)
+
+  @parameterized('sign', [1, -1])
+  def test_command_never_near_full_lock(self, sign):
+    # route 00000103 (2026-11-16): the model asked for 460 deg at 5 mph and the EPS aborted (AbortFb=9)
+    last = sign * 380.0
+    for _ in range(200):
+      last = apply_fisker_steer_angle_limits(sign * 460.0, last, 2.3, sign * 445.0, True, True)
+      assert abs(last) <= LAT_ANGLE_CMD_MAX
+    assert last == sign * LAT_ANGLE_CMD_MAX
+
+  def test_not_steering_follows_the_wheel_past_the_cap(self):
+    # the driver's own full-lock turn: the heartbeat keeps following the measured wheel (panda checks it)
+    last = 440.0
+    last = apply_fisker_steer_angle_limits(0.0, last, 1.0, 466.0, False, True)
+    assert last > LAT_ANGLE_CMD_MAX
+    assert apply_fisker_steer_angle_limits(0.0, 0.0, 1.0, 466.0, False, False) == 466.0
 
   def test_disabled_heartbeat_matches_measured_angle(self):
     assert apply_fisker_steer_angle_limits(50, 20, 15, -10, False, False) == -10
