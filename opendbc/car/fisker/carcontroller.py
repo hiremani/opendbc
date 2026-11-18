@@ -168,16 +168,41 @@ def smooth_angle_step(target, last, step_prev, v_ego):
   changing speed by at most SMOOTH_ACCEL, slowing down in time to stop at the target. Returns (angle, step)."""
   if v_ego >= SMOOTH_MAX_SPEED:
     return target, target - last
-  rate = SMOOTH_RATE * DT_CTRL                  # deg per tick
-  accel = SMOOTH_ACCEL * DT_CTRL * DT_CTRL      # deg per tick, per tick
-  err = target - last
+  step = _ease_step(target - last, step_prev, SMOOTH_RATE * DT_CTRL, SMOOTH_ACCEL * DT_CTRL * DT_CTRL)
+  return last + step, step
+
+
+def _ease_step(err, step_prev, rate, accel):
+  """One tick of an S-curve toward a target `err` away: the step is at most `rate`, changes by at most `accel` per
+  tick, and shrinks in time to arrive at the target with no overshoot (smooth_angle_step, smooth_accel_step)."""
   # fastest step that can still stop at the target slowing by `accel` per tick: s + (s - a) + ... = s (s + a) / 2a <= d
   stop = (-accel + math.sqrt(accel * accel + 8.0 * accel * abs(err))) / 2.0
   want = math.copysign(min(abs(err), rate, stop), err)
   step = _clip(want, step_prev - accel, step_prev + accel)
-  if abs(err) < 1e-6 or (abs(step) > abs(err) and step * err > 0):
-    step = err if abs(err) <= accel else step   # land on the target, no overshoot past it
-  return last + step, step
+  if (abs(err) < 1e-6 or (abs(step) > abs(err) and step * err > 0)) and abs(err - step_prev) <= 1.1 * accel:
+    step = err   # land on the target; arriving too fast (the target moved toward us) it overshoots and comes back
+  return step
+
+
+def smooth_accel_step(target, last, step_prev, filt):
+  """One tick of the analog speed request (values.ACCEL_SMOOTH_JERK / ACCEL_SNAP*): the 0x121 request moves toward
+  openpilot's accel at most ACCEL_SMOOTH_JERK, the rate itself changes by at most ACCEL_SNAP per second, and it eases
+  into the target, so braking and drive both build in and fade out with no corner. A target below ACCEL_URGENT (a
+  lead braking hard) moves at the full ACCEL_JERK_DOWN with ACCEL_SNAP_URGENT so real braking is not delayed.
+  `filt` is the low-passed target (ACCEL_FILTER_TAU_S) from last tick. Returns (accel, step per tick, filt)."""
+  P = CarControllerParams
+  target = _clip(target, P.ACCEL_MIN, P.ACCEL_MAX)
+  urgent = target < P.ACCEL_URGENT and target < last
+  if urgent:
+    filt = min(filt, target)
+  else:
+    filt += (target - filt) * (DT_CTRL / P.ACCEL_FILTER_TAU_S)
+  target = filt
+  rate = (P.ACCEL_JERK_DOWN if urgent else P.ACCEL_SMOOTH_JERK) * DT_CTRL
+  snap = (P.ACCEL_SNAP_URGENT if urgent else P.ACCEL_SNAP) * DT_CTRL * DT_CTRL
+  step = _ease_step(target - last, step_prev, rate, snap)
+  accel = _clip(last + step, P.ACCEL_MIN, P.ACCEL_MAX)
+  return accel, accel - last, filt
 
 
 def learn_angle_trim(trim, wheel_angle, sent_angle, sent_step, v_ego, sample_ok):
@@ -224,6 +249,8 @@ class CarController(CarControllerBase):
     # frame was actively commanding (the limiter restarts from the measured accel when it was not).
     self.accel_last = 0.0
     self.was_accel_active_prev = False
+    self._accel_step = 0.0          # smooth_accel_step: the request's change last tick, m/s^2 per tick
+    self._accel_filt = 0.0          # smooth_accel_step: openpilot's accel, low-passed
 
     # Longitudinal sends only 0x121 candidates, stamped with OEM 0x121's own alive / SecOC counters (lat_candidates).
     self.was_tx_long_prev = False   # 0x121 candidates sent last tick
@@ -811,7 +838,15 @@ class CarController(CarControllerBase):
       # Jerk-limited request (apply_fisker_accel_limits): 0.0 at once when not commanding; on the first commanding
       # frame the speed-derived measured accel, so there is no step at engage or after a gas override; then at most
       # ACCEL_JERK_UP / ACCEL_JERK_DOWN per frame toward openpilot's accel.
-      accel = apply_fisker_accel_limits(actuators.accel, self.accel_last, CS.a_ego_wheel,
+      # Analog request (smooth_accel_step) first: braking and drive build in and fade out along an S-curve; the jerk
+      # limiter then stays as the hard envelope (and starts from the measured accel / goes to 0.0 at once).
+      if accel_active and self.was_accel_active_prev:
+        target, self._accel_step, self._accel_filt = smooth_accel_step(actuators.accel, self.accel_last,
+                                                                       self._accel_step, self._accel_filt)
+      else:
+        target, self._accel_step = actuators.accel, 0.0
+        self._accel_filt = _clip(CS.a_ego_wheel, CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX)
+      accel = apply_fisker_accel_limits(target, self.accel_last, CS.a_ego_wheel,
                                         accel_active, self.was_accel_active_prev)
       self.accel_last = accel
       self.was_accel_active_prev = accel_active

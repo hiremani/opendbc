@@ -120,6 +120,21 @@ class CarControllerParams:
   ACCEL_JERK_UP = 1.0                     # m/s^3, accel request increasing (incl. releasing the brake)
   ACCEL_JERK_DOWN = 2.5                   # m/s^3, accel request decreasing (incl. braking harder)
 
+  # Analog speed request (carcontroller.smooth_accel_step), driver's ask 2026-11-17: "avoid quantum jumps, make it
+  # feel like analog signal", brake application and release with continuity. The jerk limits above alone ramp at a
+  # constant rate that starts and stops at once (a corner the body feels). Here the request changes at most
+  # ACCEL_SMOOTH_JERK, that rate builds up and fades out at most ACCEL_SNAP per second (full rate in 0.25 s), and the
+  # request eases into its target. Braking harder than ACCEL_URGENT (a lead braking hard; every comfort target is
+  # gentler: cruise -1.2, stop sign -1.0, junction -1.5) uses the full ACCEL_JERK_DOWN and ACCEL_SNAP_URGENT, so
+  # real braking is never delayed by the smoothing.
+  # The target is first low-passed with ACCEL_FILTER_TAU_S (openpilot's accel jitters by a few tenths per 0.1 s; an
+  # S-curve alone chases the jitter and ratchets toward one side). Urgent braking skips the filter.
+  ACCEL_FILTER_TAU_S = 0.2                # s
+  ACCEL_SMOOTH_JERK = 1.0                 # m/s^3, comfort rate both ways
+  ACCEL_SNAP = 4.0                        # m/s^4
+  ACCEL_URGENT = -1.8                     # m/s^2
+  ACCEL_SNAP_URGENT = 10.0                # m/s^4
+
   # 0x121 ADAS_LgtCtrl_AccelReq scale: 0.0004882 m/s²/LSB, offset -16
   ACCEL_SCALE = 0.0004882
   ACCEL_OFFSET = -16.0
