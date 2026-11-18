@@ -8,13 +8,15 @@ from opendbc.car.lateral import apply_std_steer_angle_limits
 
 from opendbc.car.fisker.fiskercan import FiskerCAN
 from opendbc.car.fisker.secoc import stamp_secoc, stamp_secoc_many, sync_mac
-from opendbc.car.fisker.values import (ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_RELEASE_DEG, OVERRIDE_STEER_TORQUE,
+from opendbc.car.fisker.values import (ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_RELEASE_DEG,
                                         ANGLE_TRIM_DEG, ANGLE_TRIM_MAX, ANGLE_TRIM_MAX_CMD, ANGLE_TRIM_MAX_JUMP,
                                         ANGLE_TRIM_MIN, ANGLE_TRIM_MIN_SPEED, ANGLE_TRIM_STEADY_STEP, ANGLE_TRIM_TAU_S,
                                         LAT_ANGLE_CMD_MAX, TURN_COOP_MAX_SPEED, TURN_COOP_UNWIND_DEG,
                                         CarControllerParams, ICC_0x35B_OVERRIDES,
                                         SETTLE_ANGLE_STEP, SETTLE_MAX_TICKS, SMOOTH_ACCEL, SMOOTH_MAX_SPEED, SMOOTH_RATE,
-                                        STANDSTILL_PAUSE_SPEED)
+                                        SMOOTH_UNWIND_ACCEL, SMOOTH_UNWIND_MIN_DEG, SMOOTH_UNWIND_RATE, SETTLE_TURN_END_DEG, SETTLE_TURN_PEAK_DEG,
+                                        SETTLE_TURN_RATE, SETTLE_TURN_S, STANDSTILL_PAUSE_SPEED,
+                                        TURN_COOP_OVERRIDE_TORQUE, TURN_COOP_UNWIND_BACK_DEG)
 from opendbc.sunnypilot.car.fisker.values_ext import FiskerFlagsSP
 
 
@@ -149,26 +151,37 @@ def apply_fisker_accel_limits(target, last, measured, active, was_active):
   return _clip(step, P.ACCEL_MIN, P.ACCEL_MAX)
 
 
-def coop_signaled_turn(desired_angle, wheel_angle, wheel_step, v_ego, left_blinker, right_blinker):
+def coop_signaled_turn(desired_angle, wheel_angle, wheel_step, v_ego, left_blinker, right_blinker, unwound_deg=0.0):
   """True when taking the wheel would only continue the driver's own signaled low-speed turn: the blinker is on
-  toward the side the wheel is turned, the driver is turning into it or holding (not unwinding: wheel_step, the
-  wheel's change since the last tick, is not moving it back toward center faster than TURN_COOP_UNWIND_DEG per
-  tick), and the command is on that side too and wants at least as much turn (within ANGLE_OVERRIDE_RELEASE_DEG)
-  as the wheel has. A driver straightening out of the turn is never "cooperating". Angles in deg, positive = left."""
+  toward the side the wheel is turned, the driver is turning into it or holding (not unwinding: the wheel is not
+  coming back toward center faster than TURN_COOP_UNWIND_DEG per tick (wheel_step, its change since the last tick),
+  nor `unwound_deg` more than TURN_COOP_UNWIND_BACK_DEG back from the most it was turned), and the command is on that
+  side too and wants at least as much turn (within ANGLE_OVERRIDE_RELEASE_DEG) as the wheel has. A driver
+  straightening out of the turn is never "cooperating". Angles in deg, positive = left."""
   if v_ego >= TURN_COOP_MAX_SPEED or desired_angle * wheel_angle <= 0.0:
     return False
-  if wheel_step * math.copysign(1.0, wheel_angle) < -TURN_COOP_UNWIND_DEG:
+  if wheel_step * math.copysign(1.0, wheel_angle) < -TURN_COOP_UNWIND_DEG or unwound_deg > TURN_COOP_UNWIND_BACK_DEG:
     return False
   toward = (left_blinker and not right_blinker and wheel_angle > 0.0) or (right_blinker and not left_blinker and wheel_angle < 0.0)
   return toward and abs(desired_angle) >= abs(wheel_angle) - ANGLE_OVERRIDE_RELEASE_DEG
 
 
-def smooth_angle_step(target, last, step_prev, v_ego):
+def smooth_angle_step(target, last, step_prev, v_ego, settle=False):
   """One tick of the low-speed smooth wheel (values.SMOOTH_*): move from `last` toward `target` at most SMOOTH_RATE,
-  changing speed by at most SMOOTH_ACCEL, slowing down in time to stop at the target. Returns (angle, step)."""
+  changing speed by at most SMOOTH_ACCEL, slowing down in time to stop at the target. Coming back toward center it
+  may move at SMOOTH_UNWIND_RATE (a released wheel self-centring). `settle` (just after a turn): moving away from
+  center at most SETTLE_TURN_RATE. Returns (angle, step)."""
   if v_ego >= SMOOTH_MAX_SPEED:
     return target, target - last
-  step = _ease_step(target - last, step_prev, SMOOTH_RATE * DT_CTRL, SMOOTH_ACCEL * DT_CTRL * DT_CTRL)
+  err = target - last
+  # toward center by a real unwind (not the model's jitter), or still unwinding too fast to stop at the normal rate
+  a_norm = SMOOTH_ACCEL * DT_CTRL * DT_CTRL
+  if last * err < 0.0 and step_prev * err >= 0.0 and \
+     (abs(err) > SMOOTH_UNWIND_MIN_DEG or step_prev * step_prev / (2.0 * a_norm) > abs(err)):
+    rate, accel = SMOOTH_UNWIND_RATE, SMOOTH_UNWIND_ACCEL
+  else:
+    rate, accel = (SETTLE_TURN_RATE if settle else SMOOTH_RATE), SMOOTH_ACCEL
+  step = _ease_step(err, step_prev, rate * DT_CTRL, accel * DT_CTRL * DT_CTRL)
   return last + step, step
 
 
@@ -241,6 +254,9 @@ class CarController(CarControllerBase):
     # command trim (learn_angle_trim): the wheel settles this far left of the angle we send
     self.angle_trim = ANGLE_TRIM_DEG
     self._smooth_step = 0.0        # smooth_angle_step: the wheel command's speed last tick, deg per tick
+    self._coop_peak = 0.0          # most the wheel was turned toward the blinker in this signaled turn, deg
+    self._turn_peak = 0.0          # most the command was turned since it was last near center, deg
+    self._settle_turn_ticks = 0    # after a turn: ticks left of slow moves away from center (SETTLE_TURN_*)
     self._trim_sample_ok = False   # last tick we sent a steady command with the driver off the wheel
     self._trim_sent_prev = 0.0     # the angle sent last tick
     self._trim_step_prev = 0.0     # how much it moved from the tick before
@@ -514,9 +530,15 @@ class CarController(CarControllerBase):
     # it is not an override (on-vehicle 2026-11-14: the driver started every signaled turn 0.2-1.8 s before the
     # turn planner, the latch tripped, and since the planner's target never came back within RELEASE_DEG of a wheel
     # held through the turn, it handed every turn back for good). Pushing against us still trips the torque override.
-    coop_turn = coop_signaled_turn(desired_angle_deg, CS.out.steeringAngleDeg,
-                                   CS.out.steeringAngleDeg - self._prev_steer_angle, CS.out.vEgoRaw,
-                                   CS.out.leftBlinker, CS.out.rightBlinker)
+    wheel = CS.out.steeringAngleDeg
+    blink_side = 1.0 if (CS.out.leftBlinker and not CS.out.rightBlinker) else \
+      -1.0 if (CS.out.rightBlinker and not CS.out.leftBlinker) else 0.0
+    if blink_side == 0.0 or wheel * blink_side <= 0.0:
+      self._coop_peak = 0.0
+    else:
+      self._coop_peak = max(self._coop_peak, abs(wheel), self._prev_steer_angle * blink_side)
+    coop_turn = coop_signaled_turn(desired_angle_deg, wheel, wheel - self._prev_steer_angle, CS.out.vEgoRaw,
+                                   CS.out.leftBlinker, CS.out.rightBlinker, self._coop_peak - abs(wheel))
     if angle_diverge > ANGLE_OVERRIDE_DEG and command_diverge > ANGLE_OVERRIDE_DEG and not coop_turn:
       self._angle_override_latch = True
     elif angle_diverge < ANGLE_OVERRIDE_RELEASE_DEG or coop_turn:
@@ -529,7 +551,7 @@ class CarController(CarControllerBase):
     # however lightly, is an override.
     driver_intervening = CS.driver_intervening
     if (driver_intervening and coop_turn and getattr(CS, "torque_latch_only", False)
-        and abs(CS.out.steeringTorque) < OVERRIDE_STEER_TORQUE and CS.out.steeringTorque * CS.out.steeringAngleDeg >= 0.0):
+        and abs(CS.out.steeringTorque) < TURN_COOP_OVERRIDE_TORQUE and CS.out.steeringTorque * CS.out.steeringAngleDeg >= 0.0):
       driver_intervening = False
       self._coop_release = True
     # A torque override with the command far from the wheel latches the angle override too, so letting go of the wheel
@@ -585,9 +607,17 @@ class CarController(CarControllerBase):
     # Low-speed smooth wheel: glide toward the target instead of jumping at the full rate (values.SMOOTH_*).
     # The trim is applied after, by apply_fisker_steer_angle_limits; the panda rate limits still apply on top.
     smooth_target = desired_angle_deg
+    # After a turn: the command was beyond SETTLE_TURN_PEAK_DEG and is back near center -> settle quietly for a while.
+    cmd = abs(self.apply_angle_last)
+    self._turn_peak = 0.0 if cmd < 2.0 else max(self._turn_peak, cmd)
+    if self._turn_peak >= SETTLE_TURN_PEAK_DEG and cmd <= SETTLE_TURN_END_DEG:
+      self._settle_turn_ticks = int(SETTLE_TURN_S / DT_CTRL)
+      self._turn_peak = 0.0
+    elif self._settle_turn_ticks > 0:
+      self._settle_turn_ticks -= 1
     if lat_active:
       smoothed, self._smooth_step = smooth_angle_step(desired_angle_deg - self.angle_trim, self.apply_angle_last,
-                                                      self._smooth_step, CS.out.vEgoRaw)
+                                                      self._smooth_step, CS.out.vEgoRaw, self._settle_turn_ticks > 0)
       smooth_target = smoothed + self.angle_trim
     else:
       self._smooth_step = 0.0

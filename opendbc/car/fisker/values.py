@@ -327,4 +327,27 @@ TURN_COOP_MAX_SPEED = 9.0          # m/s (~20 mph)
 SMOOTH_MAX_SPEED = 12.0            # m/s (~27 mph): turns and low-speed manoeuvres; above, the rate limits are already small
 SMOOTH_RATE = 70.0                 # deg/s of wheel (a 135 deg turn-in takes ~2 s)
 SMOOTH_ACCEL = 300.0               # deg/s^2 (reaches full rate in ~0.25 s)
-TURN_COOP_UNWIND_DEG = 0.05        # deg/tick (5 deg/s): the wheel coming back faster than this is the driver unwinding
+# The wheel coming back toward center this fast per tick, or this far back from the most it was turned in this turn,
+# is the driver unwinding. Route 0000010e (2026-11-18, left at 12.8 min): a 5 deg/s per-tick threshold read the wheel's
+# own 0.1-0.4 deg/tick wobble under the driver's hand as unwinding, the cooperative turn dropped, and openpilot let go
+# and re-grabbed through the whole turn.
+TURN_COOP_UNWIND_DEG = 1.0         # deg/tick (100 deg/s)
+TURN_COOP_UNWIND_BACK_DEG = 15.0   # deg
+# In a cooperative signaled turn, the driver's hand resting on the wheel and pushing INTO the turn may go up to this
+# before it is an override (driver's choice, 2026-11-18). Route 0000010e: the hold into the turn was 2-3.6 Nm, just
+# over OVERRIDE_STEER_TORQUE, and openpilot let go in 8 of 9 turns. Pulling the other way (toward center) is still an
+# override at any torque, and outside a signaled low-speed turn OVERRIDE_STEER_TORQUE applies unchanged.
+TURN_COOP_OVERRIDE_TORQUE = 5.0    # Nm
+# Letting go at the end of a turn (driver's ask, 2026-11-18: "I just let go of the steering to straighten and then do
+# any little adjustment"). Unwinding toward center the wheel moves at up to SMOOTH_UNWIND_RATE, like a released wheel
+# self-centring (the turn planner's release point already assumes about this rate). After a turn (the command has been
+# beyond SETTLE_TURN_PEAK_DEG and comes back inside SETTLE_TURN_END_DEG), for SETTLE_TURN_S any move away from center
+# is slow (SETTLE_TURN_RATE): small corrections, no swing back into the turn (route 0000010e: 15 deg back left at
+# 22 mph right after straightening).
+SMOOTH_UNWIND_RATE = 180.0         # deg/s
+SMOOTH_UNWIND_ACCEL = 600.0        # deg/s^2
+SMOOTH_UNWIND_MIN_DEG = 20.0       # deg: the target this far toward center (not the model's 5-10 deg jitter)
+SETTLE_TURN_PEAK_DEG = 60.0        # deg of wheel
+SETTLE_TURN_END_DEG = 20.0         # deg of wheel
+SETTLE_TURN_S = 2.0                # s
+SETTLE_TURN_RATE = 15.0            # deg/s

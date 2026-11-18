@@ -15,7 +15,8 @@ from opendbc.car.fisker.values import (ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_RELEAS
                                         OVERRIDE_STEER_TORQUE, OVERRIDE_TRIP_FRAMES)
 from opendbc.car.lateral import apply_std_steer_angle_limits
 from opendbc.car.fisker.values import (SMOOTH_ACCEL, SMOOTH_MAX_SPEED, SMOOTH_RATE, ANGLE_TRIM_DEG, ANGLE_TRIM_MAX, ANGLE_TRIM_MIN, CarControllerParams,
-                                        LAT_ANGLE_CMD_MAX)
+                                        LAT_ANGLE_CMD_MAX, SETTLE_TURN_RATE, SETTLE_TURN_S, SMOOTH_UNWIND_ACCEL,
+                                        SMOOTH_UNWIND_RATE)
 from opendbc.testing import parameterized
 
 
@@ -284,7 +285,8 @@ class TestSteeringHandover(unittest.TestCase):
     # whole turn. In a cooperative signaled turn that latch alone no longer holds the yield.
     for torque, eps_bit, expect_steer in ((-1.8, False, True),    # holding into the turn: steer
                                           (+1.0, False, False),   # pulling back toward center: yield
-                                          (-3.5, False, False),   # pushing past the trip level: yield
+                                          (-3.5, False, True),    # firm hold into the turn, under 5 Nm: steer
+                                          (-5.5, False, False),   # pushing past TURN_COOP_OVERRIDE_TORQUE: yield
                                           (-1.8, True, False)):   # the EPS's own overpower bit: always yield
       controller, cc_sp, cs = self._turn_controller()
       cc = structs.CarControl(latActive=True)
@@ -306,6 +308,11 @@ class TestSteeringHandover(unittest.TestCase):
     assert not coop_signaled_turn(200.0, 120.0, 0.0, 2.0, False, True)       # blinker the other way
     assert not coop_signaled_turn(-263.0, 140.0, 0.0, 2.0, True, False)      # command the other way
     assert not coop_signaled_turn(-263.0, -140.0, 0.0, 2.0, True, True)      # hazards: no side
+    # route 0000010e: the wheel wobbling back 0.1-0.4 deg/tick under the driver's hand is not unwinding...
+    assert coop_signaled_turn(180.0, 88.0, -0.35, 5.0, True, False, unwound_deg=7.0)
+    # ...coming back fast, or 15+ deg from the most it was turned, is
+    assert not coop_signaled_turn(180.0, 88.0, -1.5, 5.0, True, False, unwound_deg=2.0)
+    assert not coop_signaled_turn(180.0, 70.0, -0.2, 5.0, True, False, unwound_deg=18.0)
 
   def test_torque_override_yields_below_eps_threshold(self):
     car = _make_car()
@@ -739,11 +746,38 @@ class TestSmoothWheel(unittest.TestCase):
     assert sm == 3.0
 
   def test_unwinds_smoothly_too(self):
+    # unwinding is quicker (a released wheel self-centring, SMOOTH_UNWIND_RATE) but still eases in and out
     out = _glide(lambda k: 0.0, 4.5, 4.0, start=120.0)
     rate, acc = self._rates(out)
-    assert abs(out[-1]) < 1e-6 and min(out) >= -1e-6
-    assert max(abs(x) for x in rate) <= SMOOTH_RATE + 1e-6
-    assert max(abs(x) for x in acc) <= ACCEL_TOL
+    assert abs(out[-1]) < 1e-6 and min(out) >= -0.05                    # lands on center (0.02 deg past at most)
+    assert max(abs(x) for x in rate) <= SMOOTH_UNWIND_RATE + 1e-6
+    assert max(abs(x) for x in rate) > 1.5 * SMOOTH_RATE                 # faster than turning in
+    assert max(abs(x) for x in acc) <= 1.1 * SMOOTH_UNWIND_ACCEL
+    assert out.index(next(x for x in out if abs(x) < 1.0)) < 110         # 120 deg back in ~1 s (was ~2 s)
+
+  def test_after_a_turn_corrections_are_small_and_slow(self):
+    # route 0000010e (2026-11-18): right after straightening the command swung 15 deg back into the turn at 22 mph
+    out = _glide(lambda k: 0.0 if k < 150 else 15.0, 4.5, 2.0, start=120.0)
+    # the controller sets `settle` after a turn; here, call the step directly with it on
+    last, step = 0.0, 0.0
+    for _ in range(100):
+      last, step = smooth_angle_step(40.0, last, step, 6.0, True)
+    assert last <= 15.0 + 1e-6 and SETTLE_TURN_RATE <= 15.0   # at most 15 deg/s away from center (1 s: <= 15 deg of 40)
+    back, _ = smooth_angle_step(0.0, 10.0, 0.0, 6.0, True)
+    assert back < 10.0                               # coming back to center is never held back
+    assert out[-1] > 0.0
+
+  def test_controller_settles_after_a_turn(self):
+    cp, sp, cs = _make_car()
+    controller = CarController(DBC[CAR.FISKER_OCEAN], cp, sp)
+    controller._turn_peak = 120.0
+    controller.apply_angle_last = 10.0
+    cs.out = structs.CarState(steeringAngleDeg=10.0, vEgoRaw=6.0, vEgo=6.0)
+    controller.update(structs.CarControl().as_reader(), structs.CarControlSP(), cs, 0)
+    assert controller._settle_turn_ticks > 0
+    for _ in range(int(SETTLE_TURN_S / 0.01) + 1):
+      controller.update(structs.CarControl().as_reader(), structs.CarControlSP(), cs, 0)
+    assert controller._settle_turn_ticks == 0
 
   def test_regrab_starts_from_rest(self):
     # driver let go with the target far ahead: the controller glides from the wheel, it doesn't yank
