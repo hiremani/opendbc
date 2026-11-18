@@ -305,4 +305,11 @@ ANGLE_OVERRIDE_RELEASE_DEG = 10.0  # deg
 # side the wheel is turned, a command wanting at least as much turn as the wheel has is not an override. Matches
 # the map turn planner's release speed (turn_planner.V_ABORT).
 TURN_COOP_MAX_SPEED = 9.0          # m/s (~20 mph)
+# Smooth wheel at low speed (carcontroller.smooth_angle_step). Route 00000109 (2026-11-17, left turn at 8.5 min): the
+# command ran up to 55 deg ahead of the wheel and every re-grab slewed at the full rate limit (150 deg/s at 5 m/s), a
+# ~10 deg yank 15 times in one turn; the model's target also jittered 5-10 deg per 0.1 s. Below SMOOTH_MAX_SPEED the
+# commanded wheel moves at most SMOOTH_RATE, speeds up and slows down at most SMOOTH_ACCEL, and eases into its target.
+SMOOTH_MAX_SPEED = 12.0            # m/s (~27 mph): turns and low-speed manoeuvres; above, the rate limits are already small
+SMOOTH_RATE = 70.0                 # deg/s of wheel (a 135 deg turn-in takes ~2 s)
+SMOOTH_ACCEL = 300.0               # deg/s^2 (reaches full rate in ~0.25 s)
 TURN_COOP_UNWIND_DEG = 0.05        # deg/tick (5 deg/s): the wheel coming back faster than this is the driver unwinding

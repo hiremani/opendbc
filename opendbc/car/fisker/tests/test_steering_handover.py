@@ -6,14 +6,15 @@ import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import Bus, structs
 from opendbc.car.fisker.carcontroller import (CarController, LAT_CANDIDATE_ADDR, LAT_CANDIDATE_BUS,
-                                              apply_fisker_steer_angle_limits, learn_angle_trim)
+                                              apply_fisker_steer_angle_limits, learn_angle_trim,
+                                              smooth_angle_step)
 from opendbc.car.fisker.carstate import CarState
 from opendbc.car.fisker.interface import CarInterface
 from opendbc.car.fisker.values import (ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_RELEASE_DEG, CANBUS, CAR,
                                         DBC, OVERRIDE_RELEASE_FRAMES, OVERRIDE_RELEASE_TORQUE,
                                         OVERRIDE_STEER_TORQUE, OVERRIDE_TRIP_FRAMES)
 from opendbc.car.lateral import apply_std_steer_angle_limits
-from opendbc.car.fisker.values import (ANGLE_TRIM_DEG, ANGLE_TRIM_MAX, ANGLE_TRIM_MIN, CarControllerParams,
+from opendbc.car.fisker.values import (SMOOTH_ACCEL, SMOOTH_MAX_SPEED, SMOOTH_RATE, ANGLE_TRIM_DEG, ANGLE_TRIM_MAX, ANGLE_TRIM_MIN, CarControllerParams,
                                         LAT_ANGLE_CMD_MAX)
 from opendbc.testing import parameterized
 
@@ -687,3 +688,84 @@ class TestAngleTrim(unittest.TestCase):
     cc_sp.mads.active = True
     controller.update(cc.as_reader(), cc_sp, cs, 0)
     assert abs(controller.apply_angle_last - (2.0 - controller.angle_trim)) < 1e-6
+
+
+def _glide(target_fn, v, seconds, start=0.0):
+  """Run smooth_angle_step then the normal limits, as the car controller does; returns the wheel command per tick."""
+  last, step, out = start, 0.0, []
+  for k in range(int(seconds * 100)):
+    sm, step = smooth_angle_step(target_fn(k), last, step, v)
+    last = apply_fisker_steer_angle_limits(sm, last, v, last, True, True)
+    out.append(last)
+  return out
+
+
+ACCEL_TOL = 1.1 * SMOOTH_ACCEL   # the last tick lands exactly on the target (a few thousandths of a degree)
+
+
+class TestSmoothWheel(unittest.TestCase):
+  # route 00000109 (2026-11-17): re-grabs slewed at 150 deg/s, a ~10 deg yank each, 15 times in one left turn
+  def _rates(self, out):
+    r = [(b - a) / 0.01 for a, b in zip(out, out[1:], strict=False)]
+    return r, [(b - a) / 0.01 for a, b in zip(r, r[1:], strict=False)]
+
+  @parameterized('v', [0.5, 2.3, 4.5, 8.0])
+  def test_turn_in_is_a_glide(self, v):
+    out = _glide(lambda k: 135.0, v, 4.0)
+    rate, acc = self._rates(out)
+    assert max(abs(x) for x in rate) <= SMOOTH_RATE + 1e-6
+    assert max(abs(x) for x in acc) <= ACCEL_TOL
+    assert abs(out[-1] - 135.0) < 1e-6           # it gets there (a 135 deg turn-in in ~2.2 s)
+    assert max(out) <= 135.0 + 1e-6              # and never past it
+    assert out.index(next(x for x in out if abs(x - 135.0) < 0.5)) < 260
+
+  def test_target_jitter_is_smoothed(self):
+    # the model's target jumping 5-10 deg every 0.1 s around a slow ramp
+    out = _glide(lambda k: 0.3 * k + (8.0 if (k // 10) % 2 else -8.0), 4.5, 3.0)
+    _, acc = self._rates(out)
+    assert max(abs(x) for x in acc) <= ACCEL_TOL
+
+  def test_old_limits_jump(self):
+    # for contrast: without the glide the same turn-in moves at the full rate limit (well over SMOOTH_RATE)
+    last, out = 0.0, []
+    for _ in range(100):
+      last = apply_fisker_steer_angle_limits(135.0, last, 4.5, last, True, True)
+      out.append(last)
+    rate, _ = self._rates([0.0] + out)
+    assert max(rate) > 2 * SMOOTH_RATE
+
+  def test_highway_unchanged(self):
+    sm, _ = smooth_angle_step(3.0, 0.0, 0.0, SMOOTH_MAX_SPEED + 1)
+    assert sm == 3.0
+
+  def test_unwinds_smoothly_too(self):
+    out = _glide(lambda k: 0.0, 4.5, 4.0, start=120.0)
+    rate, acc = self._rates(out)
+    assert abs(out[-1]) < 1e-6 and min(out) >= -1e-6
+    assert max(abs(x) for x in rate) <= SMOOTH_RATE + 1e-6
+    assert max(abs(x) for x in acc) <= ACCEL_TOL
+
+  def test_regrab_starts_from_rest(self):
+    # driver let go with the target far ahead: the controller glides from the wheel, it doesn't yank
+    cp, sp, cs = _make_car()
+    controller = CarController(DBC[CAR.FISKER_OCEAN], cp, sp)
+    controller.secoc_key_verified = True
+    controller.secoc_key = bytes(16)
+    controller.apply_angle_last = 80.0 - ANGLE_TRIM_DEG
+    controller.was_lat_engaged_prev = True
+    controller.was_tx_lateral_prev = True
+    controller.was_lat_active_prev = True
+    cs.out = structs.CarState(steeringAngleDeg=80.0, vEgoRaw=4.5, vEgo=4.5)
+    cs.eps_lat_sts = 2
+    cc = structs.CarControl(latActive=True)
+    cc.actuators.steeringAngleDeg = 135.0
+    cc_sp = structs.CarControlSP()
+    cc_sp.mads.active = True
+    prev = controller.apply_angle_last
+    steps = []
+    for _ in range(20):
+      controller.update(cc.as_reader(), cc_sp, cs, 0)
+      steps.append(controller.apply_angle_last - prev)
+      prev = controller.apply_angle_last
+    assert max(steps) <= SMOOTH_RATE * 0.01 + 1e-6
+    assert steps[0] <= SMOOTH_ACCEL * 1e-4 + 1e-6

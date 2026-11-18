@@ -13,7 +13,8 @@ from opendbc.car.fisker.values import (ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_RELEAS
                                         ANGLE_TRIM_MIN, ANGLE_TRIM_MIN_SPEED, ANGLE_TRIM_STEADY_STEP, ANGLE_TRIM_TAU_S,
                                         LAT_ANGLE_CMD_MAX, TURN_COOP_MAX_SPEED, TURN_COOP_UNWIND_DEG,
                                         CarControllerParams, ICC_0x35B_OVERRIDES,
-                                        SETTLE_ANGLE_STEP, SETTLE_MAX_TICKS, STANDSTILL_PAUSE_SPEED)
+                                        SETTLE_ANGLE_STEP, SETTLE_MAX_TICKS, SMOOTH_ACCEL, SMOOTH_MAX_SPEED, SMOOTH_RATE,
+                                        STANDSTILL_PAUSE_SPEED)
 from opendbc.sunnypilot.car.fisker.values_ext import FiskerFlagsSP
 
 
@@ -162,6 +163,23 @@ def coop_signaled_turn(desired_angle, wheel_angle, wheel_step, v_ego, left_blink
   return toward and abs(desired_angle) >= abs(wheel_angle) - ANGLE_OVERRIDE_RELEASE_DEG
 
 
+def smooth_angle_step(target, last, step_prev, v_ego):
+  """One tick of the low-speed smooth wheel (values.SMOOTH_*): move from `last` toward `target` at most SMOOTH_RATE,
+  changing speed by at most SMOOTH_ACCEL, slowing down in time to stop at the target. Returns (angle, step)."""
+  if v_ego >= SMOOTH_MAX_SPEED:
+    return target, target - last
+  rate = SMOOTH_RATE * DT_CTRL                  # deg per tick
+  accel = SMOOTH_ACCEL * DT_CTRL * DT_CTRL      # deg per tick, per tick
+  err = target - last
+  # fastest step that can still stop at the target slowing by `accel` per tick: s + (s - a) + ... = s (s + a) / 2a <= d
+  stop = (-accel + math.sqrt(accel * accel + 8.0 * accel * abs(err))) / 2.0
+  want = math.copysign(min(abs(err), rate, stop), err)
+  step = _clip(want, step_prev - accel, step_prev + accel)
+  if abs(err) < 1e-6 or (abs(step) > abs(err) and step * err > 0):
+    step = err if abs(err) <= accel else step   # land on the target, no overshoot past it
+  return last + step, step
+
+
 def learn_angle_trim(trim, wheel_angle, sent_angle, sent_step, v_ego, sample_ok):
   """The wheel settles at the sent angle plus an offset (values.ANGLE_TRIM_DEG). Move the estimate toward
   wheel - sent, only while we steer steadily near straight ahead and the driver is off the wheel."""
@@ -197,6 +215,7 @@ class CarController(CarControllerBase):
     self.apply_angle_last = 0.0
     # command trim (learn_angle_trim): the wheel settles this far left of the angle we send
     self.angle_trim = ANGLE_TRIM_DEG
+    self._smooth_step = 0.0        # smooth_angle_step: the wheel command's speed last tick, deg per tick
     self._trim_sample_ok = False   # last tick we sent a steady command with the driver off the wheel
     self._trim_sent_prev = 0.0     # the angle sent last tick
     self._trim_step_prev = 0.0     # how much it moved from the tick before
@@ -536,8 +555,17 @@ class CarController(CarControllerBase):
     self.angle_trim = learn_angle_trim(self.angle_trim, CS.out.steeringAngleDeg, self._trim_sent_prev,
                                        self._trim_step_prev, CS.out.vEgoRaw,
                                        self._trim_sample_ok and lat_active and not CS.out.steeringPressed)
+    # Low-speed smooth wheel: glide toward the target instead of jumping at the full rate (values.SMOOTH_*).
+    # The trim is applied after, by apply_fisker_steer_angle_limits; the panda rate limits still apply on top.
+    smooth_target = desired_angle_deg
+    if lat_active:
+      smoothed, self._smooth_step = smooth_angle_step(desired_angle_deg - self.angle_trim, self.apply_angle_last,
+                                                      self._smooth_step, CS.out.vEgoRaw)
+      smooth_target = smoothed + self.angle_trim
+    else:
+      self._smooth_step = 0.0
     self.apply_angle_last = apply_fisker_steer_angle_limits(
-      desired_angle_deg, self.apply_angle_last, CS.out.vEgoRaw,
+      smooth_target, self.apply_angle_last, CS.out.vEgoRaw,
       CS.out.steeringAngleDeg, lat_active, engaged, self.angle_trim,
     )
 
@@ -671,6 +699,8 @@ class CarController(CarControllerBase):
     self._trim_step_prev = self.apply_angle_last - self._trim_sent_prev
     self._trim_sent_prev = self.apply_angle_last
     self._trim_sample_ok = tx_lateral and lat_active
+    if not tx_lateral:
+      self._smooth_step = 0.0      # not steering: the next grab starts gliding from rest at the wheel
 
     # Handover trace (2026-11-17: on signaled turns the EPS sat at "available" instead of "active" while we requested
     # control, and the driver steered the turn; nothing in the log said which of the latches below let go, or why).
