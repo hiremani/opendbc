@@ -339,12 +339,14 @@ TURN_COOP_UNWIND_BACK_DEG = 15.0   # deg
 # override at any torque, and outside a signaled low-speed turn OVERRIDE_STEER_TORQUE applies unchanged.
 TURN_COOP_OVERRIDE_TORQUE = 5.0    # Nm
 # Letting go at the end of a turn (driver's ask, 2026-11-18: "I just let go of the steering to straighten and then do
-# any little adjustment"). Unwinding toward center the wheel moves at up to SMOOTH_UNWIND_RATE, like a released wheel
-# self-centring (the turn planner's release point already assumes about this rate). After a turn (the command has been
+# any little adjustment"). Unwinding toward center the wheel moves at up to SMOOTH_UNWIND_RATE, like the driver's own
+# hands. Measured 2026-11-20 on the driver's turns without the blinker (27 turns, routes dd..119): the wheel comes back
+# at 81 deg/s median (p75 ~110, fastest ~150), with a light grip of ~1.2 Nm, not released. The turn planner's release
+# point allows for the driver profile's turn_unwind_deg_s (bounded at this rate). After a turn (the command has been
 # beyond SETTLE_TURN_PEAK_DEG and comes back inside SETTLE_TURN_END_DEG), for SETTLE_TURN_S any move away from center
 # is slow (SETTLE_TURN_RATE): small corrections, no swing back into the turn (route 0000010e: 15 deg back left at
 # 22 mph right after straightening).
-SMOOTH_UNWIND_RATE = 180.0         # deg/s
+SMOOTH_UNWIND_RATE = 120.0         # deg/s
 SMOOTH_UNWIND_ACCEL = 600.0        # deg/s^2
 SMOOTH_UNWIND_MIN_DEG = 20.0       # deg: the target this far toward center (not the model's 5-10 deg jitter)
 SETTLE_TURN_PEAK_DEG = 60.0        # deg of wheel

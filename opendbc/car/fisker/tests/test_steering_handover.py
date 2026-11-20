@@ -746,14 +746,14 @@ class TestSmoothWheel(unittest.TestCase):
     assert sm == 3.0
 
   def test_unwinds_smoothly_too(self):
-    # unwinding is quicker (a released wheel self-centring, SMOOTH_UNWIND_RATE) but still eases in and out
+    # unwinding is quicker (the driver's own wheel return, SMOOTH_UNWIND_RATE) but still eases in and out
     out = _glide(lambda k: 0.0, 4.5, 4.0, start=120.0)
     rate, acc = self._rates(out)
     assert abs(out[-1]) < 1e-6 and min(out) >= -0.05                    # lands on center (0.02 deg past at most)
     assert max(abs(x) for x in rate) <= SMOOTH_UNWIND_RATE + 1e-6
     assert max(abs(x) for x in rate) > 1.5 * SMOOTH_RATE                 # faster than turning in
     assert max(abs(x) for x in acc) <= 1.1 * SMOOTH_UNWIND_ACCEL
-    assert out.index(next(x for x in out if abs(x) < 1.0)) < 110         # 120 deg back in ~1 s (was ~2 s)
+    assert out.index(next(x for x in out if abs(x) < 1.0)) < 120         # 120 deg back in ~1.1 s (was ~2 s at SMOOTH_RATE)
 
   def test_after_a_turn_corrections_are_small_and_slow(self):
     # route 0000010e (2026-11-18): right after straightening the command swung 15 deg back into the turn at 22 mph
