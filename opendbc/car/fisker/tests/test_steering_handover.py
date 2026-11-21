@@ -476,6 +476,88 @@ class TestSteeringHandover(unittest.TestCase):
     assert not controller._override_eps_recovery
     assert controller.engage_delay_remaining == controller.ENGAGE_DELAY_TICKS
 
+  def _engaged_controller(self, angle=0.0, speed=4.2):
+    cp, sp, cs = _make_car()
+    controller = CarController(DBC[CAR.FISKER_OCEAN], cp, sp)
+    controller.secoc_key_verified = True
+    controller.secoc_key = bytes(16)
+    cc_sp = structs.CarControlSP()
+    cc_sp.mads.active = True
+    controller.was_lat_engaged_prev = True
+    controller.was_lat_active_prev = True
+    controller.engage_delay_remaining = 0
+    cs.out = structs.CarState(steeringAngleDeg=angle, vEgoRaw=speed)
+    cs.eps_lat_sts = 2
+    target = [angle]
+
+    def tick():
+      cc = structs.CarControl(latActive=True)
+      cc.actuators.steeringAngleDeg = target[0]
+      _, frames = controller.update(cc.as_reader(), cc_sp, cs, 0)
+      return LAT_CANDIDATE_ADDR in {addr for addr, _, bus in frames if bus == LAT_CANDIDATE_BUS}
+    return controller, cs, tick, target
+
+  def test_override_recovery_waits_for_a_spinning_wheel(self):
+    # Route 00000123 (2026-11-20, 71.2 s, ~9 mph): the driver overpowered a turn (EPS -> Off, we de-assert), steered it,
+    # and let go with the wheel at 289 deg; it spun back at 230-300 deg/s. The recovery re-armed the 25-tick engage
+    # delay only, so we re-grabbed mid-spin at 92 deg, the EPS went Active against the moving wheel and aborted ~0.1 s
+    # later (AbortFb=8, "LKAS Fault: Restart the Car").
+    controller, cs, tick, target = self._engaged_controller(angle=289.0)
+    for _ in range(5):
+      assert tick()
+    target[0] = 33.0                           # the turn is ending: the model wants the wheel back near straight
+    cs.eps_lat_sts = 0                         # overpower knocks the EPS Off
+    cs.out.steeringPressed = True
+    for _ in range(3):
+      assert not tick()
+    cs.eps_lat_sts = 1                         # back to Available
+    cs.out.steeringPressed = False             # driver lets go: the wheel spins back at 250 deg/s
+    angle = 289.0
+    for _ in range(80):                        # 0.8 s of spin, far longer than the 25-tick engage delay
+      angle -= 2.5
+      cs.out = structs.CarState(steeringAngleDeg=angle, vEgoRaw=4.2)
+      assert not tick(), f"re-grabbed a wheel spinning at 250 deg/s (at {angle:.0f} deg)"
+    resumed = None
+    for i in range(60):                        # the wheel has settled
+      cs.out = structs.CarState(steeringAngleDeg=angle, vEgoRaw=4.2)
+      if tick():
+        resumed = i
+        break
+    assert resumed is not None and resumed <= 30, resumed
+
+  def test_cooperative_resume_waits_for_a_spinning_wheel(self):
+    # Routes 00000117 / 0000011c: after a cooperative signaled-turn release the settle wait is skipped on purpose, and
+    # we re-grabbed with the wheel moving 130-300 deg/s; the EPS aborted. The gate holds any TX start until it slows.
+    controller, cs, tick, target = self._engaged_controller(angle=100.0)
+    controller.was_tx_lateral_prev = False      # a burst is about to start (resume after an override pause)
+    controller.engage_delay_remaining = 0
+    controller._settle_hold = 0                 # cooperative release: no settle wait
+    controller._calm_ticks = 0
+    angle = 100.0
+    for _ in range(40):
+      angle -= 1.5                              # 150 deg/s
+      target[0] = angle - 10.0                  # the turn command sits close to the wheel (no angle override)
+      cs.out = structs.CarState(steeringAngleDeg=angle, vEgoRaw=5.0)
+      assert not tick(), f"re-grabbed a wheel moving at 150 deg/s (at {angle:.0f} deg)"
+    for _ in range(30):
+      cs.out = structs.CarState(steeringAngleDeg=angle, vEgoRaw=5.0)
+      if tick():
+        break
+    else:
+      raise AssertionError("never resumed once the wheel was still")
+
+  def test_running_burst_is_not_cut_by_a_fast_wheel(self):
+    # Only the START of a burst is gated: while we steer (a turn at 100+ deg/s of our own command), keep sending.
+    controller, cs, tick, target = self._engaged_controller(angle=0.0, speed=5.0)
+    for _ in range(30):
+      assert tick()
+    angle = 0.0
+    for _ in range(30):
+      angle += 1.5
+      target[0] = angle + 5.0                   # our command leads the wheel through the turn
+      cs.out = structs.CarState(steeringAngleDeg=angle, vEgoRaw=5.0)
+      assert tick()
+
   def test_engage_handoff_seeds_from_measured_angle(self):
     car = _make_car()
     # On-vehicle 2026-10-26: at a moving engage our command was still near 0 (model target)

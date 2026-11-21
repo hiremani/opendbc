@@ -286,6 +286,20 @@ STANDSTILL_PAUSE_SPEED = 0.447  # m/s
 SETTLE_ANGLE_STEP = 0.2   # deg/tick
 SETTLE_MAX_TICKS = 150    # ~1.5 s
 
+# Calm-wheel gate: never START sending steering (a fresh engage, a resume after an override, the EPS override-recovery
+# re-arm) while the wheel is moving fast. The settle wait above is skipped on a cooperative turn release and on the
+# override recovery, and is bounded; both re-grabbed a wheel spinning at 220-300 deg/s (self-centring after the driver
+# let go, or the driver turning it), the EPS went Active against it and aborted ~0.1 s later (AbortFb=8/9, "LKAS
+# Fault: Restart the Car"): routes 00000117 (x2), 0000011c, 00000123 (2026-11-20, 71.2 s), 00000114/0000010c near full
+# lock. Over 261 re-grabs in 9 drives every abort followed a wheel above 280 deg/s; none below 150. Hold until the wheel
+# rate (over CALM_WHEEL_RATE_WIN_TICKS) has stayed under CALM_WHEEL_RATE for CALM_WHEEL_TICKS: on those drives that
+# delays 111 of 261 re-grabs by a median 0.15 s (p90 1.3 s), and every aborting one until the wheel had calmed. No upper
+# bound: while the wheel moves this fast the driver (or the wheel's own return) is steering, and OEM's frames feed the
+# EPS meanwhile. Only the start of a TX burst is gated; a running burst is never cut.
+CALM_WHEEL_RATE = 90.0          # deg/s
+CALM_WHEEL_RATE_WIN_TICKS = 5   # rate measured over 50 ms (the EPS angle updates at ~50 Hz)
+CALM_WHEEL_TICKS = 20           # 0.2 s
+
 # The most wheel angle openpilot itself asks for (deg). The EPS aborts near full lock (~470 deg): on 2026-10-27 and on
 # route 00000103 (2026-11-16, a 5 mph left turn: the model asked for 460 deg with the wheel at 445, AbortFb=9 and a
 # permanent LKAS fault, and the car's own cruise then pulled away at +2.5 m/s^2). The turn assist's tightest arc needs

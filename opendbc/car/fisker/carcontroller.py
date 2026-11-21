@@ -13,6 +13,7 @@ from opendbc.car.fisker.values import (ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_RELEAS
                                         ANGLE_TRIM_MIN, ANGLE_TRIM_MIN_SPEED, ANGLE_TRIM_STEADY_STEP, ANGLE_TRIM_TAU_S,
                                         LAT_ANGLE_CMD_MAX, TURN_COOP_MAX_SPEED, TURN_COOP_UNWIND_DEG,
                                         CarControllerParams, ICC_0x35B_OVERRIDES,
+                                        CALM_WHEEL_RATE, CALM_WHEEL_RATE_WIN_TICKS, CALM_WHEEL_TICKS,
                                         SETTLE_ANGLE_STEP, SETTLE_MAX_TICKS, SMOOTH_ACCEL, SMOOTH_MAX_SPEED, SMOOTH_RATE,
                                         SMOOTH_UNWIND_ACCEL, SMOOTH_UNWIND_MIN_DEG, SMOOTH_UNWIND_RATE, SETTLE_TURN_END_DEG, SETTLE_TURN_PEAK_DEG,
                                         SETTLE_TURN_RATE, SETTLE_TURN_S, STANDSTILL_PAUSE_SPEED,
@@ -296,6 +297,8 @@ class CarController(CarControllerBase):
     self.was_lat_active_prev = False    # rising edge of lat_active within a session -> smooth re-entry
     self._settle_hold = 0               # ticks left to wait for the wheel to stop self-centering
     self._prev_steer_angle = 0.0        # for the settle angle-rate check
+    self._wheel_hist: list[float] = []  # last CALM_WHEEL_RATE_WIN_TICKS + 1 wheel angles, for the calm-wheel gate
+    self._calm_ticks = CALM_WHEEL_TICKS # consecutive ticks the wheel rate stayed under CALM_WHEEL_RATE (no history: calm)
     self._angle_override_latch = False  # measured wheel diverged far from command -> driver steering
     self._coop_release = False          # the latch was just released by a cooperative signaled turn
 
@@ -714,6 +717,13 @@ class CarController(CarControllerBase):
     # De-asserting lets OEM's own 0x1D0 feed the EPS through the maneuver (OEM handles its own
     # resets); the latch clears on return-to-center and the resume-edge re-arm re-grabs cleanly.
     if self._angle_override_latch:
+      tx_lateral = False
+
+    # Calm-wheel gate (values.CALM_WHEEL_*): a TX burst may only start once the wheel has been slow for a while.
+    self._wheel_hist = (self._wheel_hist + [CS.out.steeringAngleDeg])[-(CALM_WHEEL_RATE_WIN_TICKS + 1):]
+    wheel_rate = (self._wheel_hist[-1] - self._wheel_hist[0]) / (max(len(self._wheel_hist) - 1, 1) * DT_CTRL)
+    self._calm_ticks = self._calm_ticks + 1 if abs(wheel_rate) < CALM_WHEEL_RATE else 0
+    if tx_lateral and not self.was_tx_lateral_prev and not in_fade and self._calm_ticks < CALM_WHEEL_TICKS:
       tx_lateral = False
 
     # Handoff seeding: whenever we are NOT transmitting lateral (not engaged, or still
